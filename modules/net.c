@@ -1,15 +1,18 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2014 Kevin Lange
+ * Copyright (C) 2014-2018 K. Lange
  */
-#include <module.h>
-#include <logging.h>
-#include <hashmap.h>
-#include <ipv4.h>
-#include <printf.h>
-#include <tokenize.h>
-#include <mod/net.h>
+#include <kernel/module.h>
+#include <kernel/logging.h>
+#include <kernel/ipv4.h>
+#include <kernel/printf.h>
+#include <kernel/tokenize.h>
+#include <kernel/mod/net.h>
+#include <kernel/mod/procfs.h>
+
+#include <toaru/list.h>
+#include <toaru/hashmap.h>
 
 static hashmap_t * dns_cache;
 static list_t * dns_waiters = NULL;
@@ -20,20 +23,102 @@ static hashmap_t *_udp_sockets = NULL;
 
 static void parse_dns_response(fs_node_t * tty, void * last_packet);
 static size_t write_dns_packet(uint8_t * buffer, size_t queries_len, uint8_t * queries);
+size_t write_dhcp_request(uint8_t * buffer, uint8_t * ip);
+static size_t write_arp_request(uint8_t * buffer, uint32_t ip);
 
-static struct netif _netif;
+static uint8_t _gateway[6] = {255,255,255,255,255,255};
 
-void init_netif_funcs(get_mac_func mac_func, get_packet_func get_func, send_packet_func send_func) {
+static struct netif _netif = {0};
+
+static int tasklet_pid = 0;
+
+uint32_t get_primary_dns(void);
+
+static uint32_t netif_func(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer) {
+	char * buf = malloc(4096);
+
+	struct netif * netif = &_netif;
+	char ip[16];
+	ip_ntoa(netif->source, ip);
+	char dns[16];
+	ip_ntoa(get_primary_dns(), dns);
+	char gw[16];
+	ip_ntoa(netif->gateway, gw);
+
+	if (netif->hwaddr[0] == 0 &&
+		netif->hwaddr[1] == 0 &&
+		netif->hwaddr[2] == 0 &&
+		netif->hwaddr[3] == 0 &&
+		netif->hwaddr[4] == 0 &&
+		netif->hwaddr[5] == 0) {
+
+		sprintf(buf, "no network\n");
+	} else {
+		sprintf(buf,
+			"ip:\t%s\n"
+			"mac:\t%2x:%2x:%2x:%2x:%2x:%2x\n"
+			"device:\t%s\n"
+			"dns:\t%s\n"
+			"gateway:\t%s\n"
+			,
+			ip,
+			netif->hwaddr[0], netif->hwaddr[1], netif->hwaddr[2], netif->hwaddr[3], netif->hwaddr[4], netif->hwaddr[5],
+			netif->driver,
+			dns,
+			gw
+		);
+	}
+
+	size_t _bsize = strlen(buf);
+	if (offset > _bsize) {
+		free(buf);
+		return 0;
+	}
+	if (size > _bsize - offset) size = _bsize - offset;
+
+	memcpy(buffer, buf + offset, size);
+	free(buf);
+	return size;
+}
+
+static struct procfs_entry netif_entry = {
+	0, /* filled by install */
+	"netif",
+	netif_func,
+};
+
+void init_netif_funcs(get_mac_func mac_func, get_packet_func get_func, send_packet_func send_func, char * device) {
 	_netif.get_mac = mac_func;
 	_netif.get_packet = get_func;
 	_netif.send_packet = send_func;
+	_netif.driver = device;
 	memcpy(_netif.hwaddr, _netif.get_mac(), sizeof(_netif.hwaddr));
+
+	if (!netif_entry.id) {
+		int (*procfs_install)(struct procfs_entry *) = (int (*)(struct procfs_entry *))(uintptr_t)hashmap_get(modules_get_symbols(),"procfs_install");
+		if (procfs_install) {
+			procfs_install(&netif_entry);
+		}
+	}
+
+	if (!tasklet_pid) {
+		tasklet_pid = create_kernel_tasklet(net_handler, "[net]", NULL);
+		debug_print(NOTICE, "Network worker tasklet started with pid %d", tasklet_pid);
+	}
+}
+
+struct netif * get_default_network_interface(void) {
+	return &_netif;
+}
+
+uint32_t get_primary_dns(void) {
+	return _dns_server;
 }
 
 uint32_t ip_aton(const char * in) {
 	char ip[16];
 	char * c = ip;
-	int out[4];
+	uint32_t out[4];
 	char * i;
 	memcpy(ip, in, strlen(in) < 15 ? strlen(in) + 1 : 15);
 	ip[15] = '\0';
@@ -179,6 +264,33 @@ size_t dns_name_to_normal_name(struct dns_packet * dns, size_t offset, char * bu
 	return i-1;
 }
 
+size_t get_dns_name(char * buffer, struct dns_packet * dns, size_t offset) {
+	uint8_t * bytes = (uint8_t *)dns;
+	while (1) {
+		uint8_t c = bytes[offset];
+		if (c == 0) {
+			offset++;
+			return offset;
+		} else if (c >= 0xC0) {
+			uint16_t ref = ((c - 0xC0) << 8) + bytes[offset+1];
+			get_dns_name(buffer, dns, ref);
+			offset++;
+			offset++;
+			return offset;
+		} else {
+			for (int i = 0; i < c; ++i) {
+				*buffer = bytes[offset+1+i];
+				buffer++;
+				*buffer = '\0';
+			}
+			*buffer = '.';
+			buffer++;
+			*buffer = '\0';
+			offset += c + 1;
+		}
+	}
+}
+
 size_t print_dns_name(fs_node_t * tty, struct dns_packet * dns, size_t offset) {
 	uint8_t * bytes = (uint8_t *)dns;
 	while (1) {
@@ -275,7 +387,44 @@ static char * fgets(char * buf, int size, struct socket * stream) {
 	return buf;
 }
 
-static uint32_t socket_read(fs_node_t * node, uint32_t offset, uint32_t size, uint8_t * buffer) {
+static void socket_alert_waiters(struct socket * sock) {
+	if (sock->alert_waiters) {
+		while (sock->alert_waiters->head) {
+			node_t * node = list_dequeue(sock->alert_waiters);
+			process_t * p = node->value;
+			process_alert_node(p, sock);
+			free(node);
+		}
+	}
+}
+
+
+static int socket_check(fs_node_t * node) {
+	struct socket * sock = node->device;
+
+	if (sock->bytes_available) {
+		return 0;
+	}
+
+	if (sock->packet_queue->length > 0) {
+		return 0;
+	}
+
+	return 1;
+}
+
+static int socket_wait(fs_node_t * node, void * process) {
+	struct socket * sock = node->device;
+
+	if (!list_find(sock->alert_waiters, process)) {
+		list_insert(sock->alert_waiters, process);
+	}
+
+	list_insert(((process_t *)process)->node_waits, sock);
+	return 0;
+}
+
+static uint32_t socket_read(fs_node_t * node, uint64_t offset, uint32_t size, uint8_t * buffer) {
 	/* Sleep until we have something to receive */
 #if 0
 	fgets((char *)buffer, size, node->device);
@@ -284,7 +433,7 @@ static uint32_t socket_read(fs_node_t * node, uint32_t offset, uint32_t size, ui
 	return net_recv(node->device, buffer, size);
 #endif
 }
-static uint32_t socket_write(fs_node_t * node, uint32_t offset, uint32_t size, uint8_t * buffer) {
+static uint32_t socket_write(fs_node_t * node, uint64_t offset, uint32_t size, uint8_t * buffer) {
 	/* Add the packet to the appropriate interface queue and send it off. */
 
 	net_send((struct socket *)node->device, buffer, size, 0);
@@ -328,6 +477,7 @@ static int gethost(char * name, uint32_t * ip) {
 			debug_print(WARNING, "   In Cache: %s → %x", name, ip);
 			return 0;
 		} else {
+			debug_print(WARNING, "   Not in cache: %s", name);
 			debug_print(WARNING, "   Still needs look up.");
 			char * xname = strdup(name);
 			char * queries = malloc(1024);
@@ -347,6 +497,8 @@ static int gethost(char * name, uint32_t * ip) {
 			queries[c+3] = 0x01; /* IN */
 			free(xname);
 
+			debug_print(WARNING, "Querying...");
+
 			void * tmp = malloc(1024);
 			size_t packet_size = write_dns_packet(tmp, c + 4, (uint8_t *)queries);
 			free(queries);
@@ -355,18 +507,34 @@ static int gethost(char * name, uint32_t * ip) {
 			free(tmp);
 
 			/* wait for response */
-			sleep_on(dns_waiters);
+			if (current_process->id != tasklet_pid) {
+				sleep_on(dns_waiters);
+			}
 			if (hashmap_has(dns_cache, name)) {
 				*ip = ip_aton(hashmap_get(dns_cache, name));
 				debug_print(WARNING, "   Now in cache: %s → %x", name, ip);
 				return 0;
 			} else {
+				if (current_process->id == tasklet_pid) {
+					debug_print(WARNING, "Query hasn't returned yet, but we're in the network thread, so we need to yield.");
+					return 2;
+				}
+				gethost(name,ip);
 				return 1;
 			}
 		}
 	}
 }
 
+static int net_send_tcp(struct socket *socket, uint16_t flags, uint8_t * payload, uint32_t payload_size);
+
+static void socket_close(fs_node_t * node) {
+	debug_print(WARNING, "Closing socket");
+	struct socket * sock = node->device;
+	if (sock->status == 1) return; /* already closed */
+	net_send_tcp(sock, TCP_FLAGS_ACK | TCP_FLAGS_FIN, NULL, 0);
+	sock->status = 2;
+}
 
 /* TODO: socket_close - TCP close; UDP... just clean us up */
 /* TODO: socket_open - idk, whatever */
@@ -392,11 +560,14 @@ static fs_node_t * finddir_netfs(fs_node_t * node, char * name) {
 	memset(fnode, 0x00, sizeof(fs_node_t));
 	fnode->inode = 0;
 	strcpy(fnode->name, name);
-	fnode->mask = 0555;
+	fnode->mask = 0666;
 	fnode->flags   = FS_CHARDEVICE;
 	fnode->read    = socket_read;
 	fnode->write   = socket_write;
+	fnode->close   = socket_close;
 	fnode->device  = (void *)net_open(SOCK_STREAM);
+	fnode->selectcheck = socket_check;
+	fnode->selectwait = socket_wait;
 
 	net_connect((struct socket *)fnode->device, ip, port);
 
@@ -495,7 +666,8 @@ static size_t write_dns_packet(uint8_t * buffer, size_t queries_len, uint8_t * q
 static int net_send_ether(struct socket *socket, struct netif* netif, uint16_t ether_type, void* payload, uint32_t payload_size) {
 	struct ethernet_packet *eth = malloc(sizeof(struct ethernet_packet) + payload_size);
 	memcpy(eth->source, netif->hwaddr, sizeof(eth->source));
-	memset(eth->destination, 0xFF, sizeof(eth->destination));
+	//memset(eth->destination, 0xFF, sizeof(eth->destination));
+	memcpy(eth->destination, _gateway, sizeof(_gateway));
 	eth->type = htons(ether_type);
 
 	if (payload_size) {
@@ -598,6 +770,7 @@ int net_close(struct socket* socket) {
 	// socket->is_connected;
 	socket->status = 1; /* Disconnected */
 	wakeup_queue(socket->packet_wait);
+	socket_alert_waiters(socket);
 	return 1;
 }
 
@@ -643,7 +816,7 @@ size_t net_recv(struct socket* socket, uint8_t* buffer, size_t len) {
 		free(node);
 	}
 
-	size_to_read = MIN(len, offset + socket->bytes_available);
+	size_to_read = MIN(len, socket->bytes_available);
 
 	if (tcpdata->payload != 0) {
 		memcpy(buffer + offset, tcpdata->payload + socket->bytes_read, size_to_read);
@@ -652,8 +825,8 @@ size_t net_recv(struct socket* socket, uint8_t* buffer, size_t len) {
 	offset += size_to_read;
 
 	if (size_to_read < socket->bytes_available) {
-		socket->bytes_available = socket->bytes_available - size_to_read;
-		socket->bytes_read = size_to_read;
+		socket->bytes_available -= size_to_read;
+		socket->bytes_read += size_to_read;
 		socket->current_packet = tcpdata;
 	} else {
 		socket->bytes_available = 0;
@@ -677,8 +850,21 @@ static void net_handle_tcp(struct tcp_header * tcp, size_t length) {
 	if (hashmap_has(_tcp_sockets, (void *)ntohs(tcp->destination_port))) {
 		struct socket *socket = hashmap_get(_tcp_sockets, (void *)ntohs(tcp->destination_port));
 
+		if (socket->status == 2) {
+			debug_print(WARNING, "Received packet while connection is in 'closing' statuus");
+		}
+
 		if (socket->status == 1) {
-			debug_print(ERROR, "Socket is closed, but still receiving packets. Should send FIN. socket=0x%x", socket);
+			if ((htons(tcp->flags) & TCP_FLAGS_FIN)) {
+				debug_print(WARNING, "TCP close sequence continues");
+				return;
+			}
+			if ((htons(tcp->flags) & TCP_FLAGS_ACK)) {
+				debug_print(WARNING, "TCP close sequence continues");
+				return;
+			}
+			debug_print(ERROR, "Socket is closed? Should send FIN. socket=0x%x flags=0x%x", socket, tcp->flags);
+			net_send_tcp(socket, TCP_FLAGS_FIN | TCP_FLAGS_ACK, NULL, 0);
 			return;
 		}
 
@@ -743,6 +929,7 @@ static void net_handle_tcp(struct tcp_header * tcp, size_t length) {
 			net_send_tcp(socket, TCP_FLAGS_ACK, NULL, 0);
 
 			wakeup_queue(socket->packet_wait);
+			socket_alert_waiters(socket);
 
 			if (htons(tcp->flags) & TCP_FLAGS_FIN) {
 				/* We should make sure we finish sending before closing. */
@@ -767,6 +954,19 @@ static void net_handle_udp(struct udp_packet * udp, size_t length) {
 	if (ntohs(udp->source_port) == 53) {
 		debug_print(WARNING, "UDP response to DNS query!");
 		parse_dns_response(debug_file, udp);
+		return;
+	}
+
+	if (ntohs(udp->source_port) == 67) {
+		debug_print(WARNING, "UDP response to DHCP!");
+
+		{
+			void * tmp = malloc(1024);
+			size_t packet_size = write_arp_request(tmp, _netif.gateway);
+			_netif.send_packet(tmp, packet_size);
+			free(tmp);
+		}
+
 		return;
 	}
 
@@ -816,6 +1016,7 @@ int net_connect(struct socket* socket, uint32_t dest_ip, uint16_t dest_port) {
 
 	socket->packet_queue = list_create();
 	socket->packet_wait = list_create();
+	socket->alert_waiters = list_create();
 
 	socket->ip = dest_ip; //ip_aton("10.255.50.206");
 	socket->port_dest = dest_port; //12345;
@@ -834,22 +1035,28 @@ int net_connect(struct socket* socket, uint32_t dest_ip, uint16_t dest_port) {
 }
 
 static void placeholder_dhcp(void) {
-	debug_print(NOTICE, "Sending DHCP discover\n");
+	debug_print(NOTICE, "Sending DHCP discover");
 	void * tmp = malloc(1024);
 	size_t packet_size = write_dhcp_packet(tmp);
 	_netif.send_packet(tmp, packet_size);
 	free(tmp);
 
-	{
+	while (1) {
 		struct ethernet_packet * eth = (struct ethernet_packet *)_netif.get_packet();
 		uint16_t eth_type = ntohs(eth->type);
 
-		debug_print(NOTICE, "Ethernet II, Src: (%2x:%2x:%2x:%2x:%2x:%2x), Dst: (%2x:%2x:%2x:%2x:%2x:%2x) [type=%4x)\n",
+		debug_print(NOTICE, "Ethernet II, Src: (%2x:%2x:%2x:%2x:%2x:%2x), Dst: (%2x:%2x:%2x:%2x:%2x:%2x) [type=%4x])",
 				eth->source[0], eth->source[1], eth->source[2],
 				eth->source[3], eth->source[4], eth->source[5],
 				eth->destination[0], eth->destination[1], eth->destination[2],
 				eth->destination[3], eth->destination[4], eth->destination[5],
 				eth_type);
+
+		if (eth_type != 0x0800) {
+			debug_print(WARNING, "ARP packet while waiting for DHCP...");
+			free(eth);
+			continue;
+		}
 
 
 		struct ipv4_packet * ipv4 = (struct ipv4_packet *)eth->payload;
@@ -863,23 +1070,37 @@ static void placeholder_dhcp(void) {
 		ip_ntoa(src_addr, src_ip);
 		ip_ntoa(dst_addr, dst_ip);
 
-		debug_print(NOTICE, "IP packet [%s → %s] length=%d bytes\n",
+		debug_print(NOTICE, "IP packet [%s → %s] length=%d bytes",
 				src_ip, dst_ip, length);
+
+		if (ipv4->protocol != IPV4_PROT_UDP) {
+			debug_print(WARNING, "Protocol: %d", ipv4->protocol);
+			debug_print(WARNING, "Bad packet...");
+			free(eth);
+			continue;
+		}
 
 		struct udp_packet * udp = (struct udp_packet *)ipv4->payload;;
 		uint16_t src_port = ntohs(udp->source_port);
 		uint16_t dst_port = ntohs(udp->destination_port);
 		uint16_t udp_len  = ntohs(udp->length);
 
-		debug_print(NOTICE, "UDP [%d → %d] length=%d bytes\n",
+		debug_print(NOTICE, "UDP [%d → %d] length=%d bytes",
 				src_port, dst_port, udp_len);
+
+		if (dst_port != 68) {
+			debug_print(WARNING, "Destination port: %d", dst_port);
+			debug_print(WARNING, "Bad packet...");
+			free(eth);
+			continue;
+		}
 
 		struct dhcp_packet * dhcp = (struct dhcp_packet *)udp->payload;
 		uint32_t yiaddr = ntohl(dhcp->yiaddr);
 
 		char yiaddr_ip[16];
 		ip_ntoa(yiaddr, yiaddr_ip);
-		debug_print(NOTICE,  "DHCP Offer: %s\n", yiaddr_ip);
+		debug_print(NOTICE,  "DHCP Offer: %s", yiaddr_ip);
 
 		_netif.source = yiaddr;
 
@@ -902,14 +1123,196 @@ static void placeholder_dhcp(void) {
 				ip_ntoa(dnsaddr, ip);
 				debug_print(NOTICE, "Found one: %s", ip);
 				_dns_server = dnsaddr;
+			} else if (type == 3) {
+				_netif.gateway = ntohl(*(uint32_t *)data);
 			}
 
 			j += 2 + len;
 			i += 2 + len;
 		}
 
+		debug_print(NOTICE, "Sending DHCP Request...");
+		void * tmp = malloc(1024);
+		size_t packet_size = write_dhcp_request(tmp, (uint8_t *)&dhcp->yiaddr);
+		_netif.send_packet(tmp, packet_size);
+		free(tmp);
 
 		free(eth);
+
+		break;
+	}
+
+}
+
+struct arp {
+	uint16_t htype;
+	uint16_t proto;
+
+	uint8_t hlen;
+	uint8_t plen;
+
+	uint16_t oper;
+
+	uint8_t sender_ha[6];
+	uint32_t sender_ip;
+	uint8_t target_ha[6];
+	uint32_t target_ip;
+
+	uint8_t padding[18];
+} __attribute__((packed));
+
+static size_t write_arp_response(uint8_t * buffer, struct arp * source) {
+	size_t offset = 0;
+
+	/* Then, let's write an ethernet frame */
+	struct ethernet_packet eth_out = {
+		.source = { _netif.hwaddr[0], _netif.hwaddr[1], _netif.hwaddr[2],
+		            _netif.hwaddr[3], _netif.hwaddr[4], _netif.hwaddr[5] },
+		.destination = BROADCAST_MAC,
+		.type = htons(0x0806),
+	};
+
+	memcpy(&buffer[offset], &eth_out, sizeof(struct ethernet_packet));
+	offset += sizeof(struct ethernet_packet);
+
+	struct arp arp_out;
+
+	arp_out.htype = source->htype;
+	arp_out.proto = source->proto;
+
+	arp_out.hlen = 6;
+	arp_out.plen = 4;
+	arp_out.oper = ntohs(2);
+
+	arp_out.sender_ha[0] = _netif.hwaddr[0];
+	arp_out.sender_ha[1] = _netif.hwaddr[1];
+	arp_out.sender_ha[2] = _netif.hwaddr[2];
+	arp_out.sender_ha[3] = _netif.hwaddr[3];
+	arp_out.sender_ha[4] = _netif.hwaddr[4];
+	arp_out.sender_ha[5] = _netif.hwaddr[5];
+	arp_out.sender_ip = ntohl(_netif.source);
+
+	arp_out.target_ha[0] = source->sender_ha[0];
+	arp_out.target_ha[1] = source->sender_ha[1];
+	arp_out.target_ha[2] = source->sender_ha[2];
+	arp_out.target_ha[3] = source->sender_ha[3];
+	arp_out.target_ha[4] = source->sender_ha[4];
+	arp_out.target_ha[5] = source->sender_ha[5];
+
+	arp_out.target_ip = source->sender_ip;
+
+	memcpy(&buffer[offset], &arp_out, sizeof(struct arp));
+	offset += sizeof(struct arp);
+
+	return offset;
+}
+
+static size_t write_arp_request(uint8_t * buffer, uint32_t ip) {
+	size_t offset = 0;
+
+	debug_print(WARNING, "Request ARP from gateway address %x", ip);
+
+	/* Then, let's write an ethernet frame */
+	struct ethernet_packet eth_out = {
+		.source = { _netif.hwaddr[0], _netif.hwaddr[1], _netif.hwaddr[2],
+		            _netif.hwaddr[3], _netif.hwaddr[4], _netif.hwaddr[5] },
+		.destination = BROADCAST_MAC,
+		.type = htons(0x0806),
+	};
+
+	memcpy(&buffer[offset], &eth_out, sizeof(struct ethernet_packet));
+	offset += sizeof(struct ethernet_packet);
+
+	struct arp arp_out;
+
+	arp_out.htype = ntohs(1);
+
+	debug_print(WARNING, "Request ARP from gateway address %x", ip);
+	arp_out.proto = ntohs(0x0800);
+
+	arp_out.hlen = 6;
+	arp_out.plen = 4;
+	arp_out.oper = ntohs(1);
+
+	arp_out.sender_ha[0] = _netif.hwaddr[0];
+	arp_out.sender_ha[1] = _netif.hwaddr[1];
+	arp_out.sender_ha[2] = _netif.hwaddr[2];
+	arp_out.sender_ha[3] = _netif.hwaddr[3];
+	arp_out.sender_ha[4] = _netif.hwaddr[4];
+	arp_out.sender_ha[5] = _netif.hwaddr[5];
+	arp_out.sender_ip = ntohl(_netif.source);
+
+	arp_out.target_ha[0] = 0;
+	arp_out.target_ha[1] = 0;
+	arp_out.target_ha[2] = 0;
+	arp_out.target_ha[3] = 0;
+	arp_out.target_ha[4] = 0;
+	arp_out.target_ha[5] = 0;
+
+	arp_out.target_ip = ntohl(ip);
+
+	memcpy(&buffer[offset], &arp_out, sizeof(struct arp));
+	offset += sizeof(struct arp);
+
+	return offset;
+}
+
+
+static void net_handle_arp(struct ethernet_packet * eth) {
+	debug_print(WARNING, "ARP packet...");
+
+	struct arp * arp = (struct arp *)&eth->payload;
+
+	char sender_ip[16];
+	char target_ip[16];
+
+	ip_ntoa(ntohl(arp->sender_ip), sender_ip);
+	ip_ntoa(ntohl(arp->target_ip), target_ip);
+
+	debug_print(WARNING, "%2x:%2x:%2x:%2x:%2x:%2x (%s) → %2x:%2x:%2x:%2x:%2x:%2x (%s) is",
+		arp->sender_ha[0],
+		arp->sender_ha[1],
+		arp->sender_ha[2],
+		arp->sender_ha[3],
+		arp->sender_ha[4],
+		arp->sender_ha[5],
+		sender_ip,
+		arp->target_ha[0],
+		arp->target_ha[1],
+		arp->target_ha[2],
+		arp->target_ha[3],
+		arp->target_ha[4],
+		arp->target_ha[5],
+		target_ip);
+
+	if (ntohs(arp->oper) == 1) {
+
+		if (ntohl(arp->target_ip) == _netif.source) {
+			debug_print(WARNING, "That's us!");
+
+			{
+				void * tmp = malloc(1024);
+				size_t packet_size = write_arp_response(tmp, arp);
+				_netif.send_packet(tmp, packet_size);
+				free(tmp);
+			}
+
+		}
+
+	} else {
+		if (ntohl(arp->target_ip) == _netif.source) {
+			debug_print(WARNING, "It's a response to our query!");
+			if (ntohl(arp->sender_ip) == _netif.gateway) {
+				_gateway[0] = arp->sender_ha[0];
+				_gateway[1] = arp->sender_ha[1];
+				_gateway[2] = arp->sender_ha[2];
+				_gateway[3] = arp->sender_ha[3];
+				_gateway[4] = arp->sender_ha[4];
+				_gateway[5] = arp->sender_ha[5];
+			}
+		} else {
+			debug_print(WARNING, "Response to someone else...\n");
+		}
 	}
 
 }
@@ -937,7 +1340,7 @@ void net_handler(void * data, char * name) {
 				net_handle_ipv4((struct ipv4_packet *)eth->payload);
 				break;
 			case ETHERNET_TYPE_ARP:
-				// net_handle_arp(eth);
+				net_handle_arp(eth);
 				break;
 		}
 
@@ -955,6 +1358,10 @@ size_t write_dhcp_packet(uint8_t * buffer) {
 		53, /* Message type */
 		1,  /* Length: 1 */
 		1,  /* Discover */
+		55,
+		2,
+		3,
+		6,
 		255, /* END */
 	};
 
@@ -1042,6 +1449,111 @@ size_t write_dhcp_packet(uint8_t * buffer) {
 	return offset;
 }
 
+size_t write_dhcp_request(uint8_t * buffer, uint8_t * ip) {
+	size_t offset = 0;
+	size_t payload_size = sizeof(struct dhcp_packet);
+
+	/* First, let's figure out how big this is supposed to be... */
+
+	uint8_t dhcp_options[] = {
+		53, /* Message type */
+		1,  /* Length: 1 */
+		3,  /* Request */
+		50,
+		4,  /* requested ip */
+		ip[0],ip[1],ip[2],ip[3],
+		55,
+		2,
+		3,
+		6,
+		255, /* END */
+	};
+
+	payload_size += sizeof(dhcp_options);
+
+	/* Then, let's write an ethernet frame */
+	struct ethernet_packet eth_out = {
+		.source = { _netif.hwaddr[0], _netif.hwaddr[1], _netif.hwaddr[2],
+		            _netif.hwaddr[3], _netif.hwaddr[4], _netif.hwaddr[5] },
+		.destination = BROADCAST_MAC,
+		.type = htons(0x0800),
+	};
+
+	memcpy(&buffer[offset], &eth_out, sizeof(struct ethernet_packet));
+	offset += sizeof(struct ethernet_packet);
+
+	/* Prepare the IPv4 header */
+	uint16_t _length = htons(sizeof(struct ipv4_packet) + sizeof(struct udp_packet) + payload_size);
+	uint16_t _ident  = htons(1);
+
+	struct ipv4_packet ipv4_out = {
+		.version_ihl = ((0x4 << 4) | (0x5 << 0)), /* 4 = ipv4, 5 = no options */
+		.dscp_ecn = 0, /* not setting either of those */
+		.length = _length,
+		.ident = _ident,
+		.flags_fragment = 0,
+		.ttl = 0x40,
+		.protocol = IPV4_PROT_UDP,
+		.checksum = 0, /* fill this in later */
+		.source = htonl(ip_aton("0.0.0.0")),
+		.destination = htonl(ip_aton("255.255.255.255")),
+	};
+
+	uint16_t checksum = calculate_ipv4_checksum(&ipv4_out);
+	ipv4_out.checksum = htons(checksum);
+
+	memcpy(&buffer[offset], &ipv4_out, sizeof(struct ipv4_packet));
+	offset += sizeof(struct ipv4_packet);
+
+	uint16_t _udp_source = htons(68);
+	uint16_t _udp_destination = htons(67);
+	uint16_t _udp_length = htons(sizeof(struct udp_packet) + payload_size);
+
+	/* Now let's build a UDP packet */
+	struct udp_packet udp_out = {
+		.source_port = _udp_source,
+		.destination_port = _udp_destination,
+		.length = _udp_length,
+		.checksum = 0,
+	};
+
+	/* XXX calculate checksum here */
+
+	memcpy(&buffer[offset], &udp_out, sizeof(struct udp_packet));
+	offset += sizeof(struct udp_packet);
+
+	/* BOOTP headers */
+	struct dhcp_packet bootp_out = {
+		.op = 1,
+		.htype = 1,
+		.hlen = 6, /* mac address... */
+		.hops = 0,
+		.xid = htonl(0x1337), /* transaction id */
+		.secs = 0,
+		.flags = 0,
+
+		.ciaddr = 0x000000,
+		.yiaddr = 0x000000,
+		.siaddr = 0x000000,
+		.giaddr = 0x000000,
+
+		.chaddr = { _netif.hwaddr[0], _netif.hwaddr[1], _netif.hwaddr[2],
+		            _netif.hwaddr[3], _netif.hwaddr[4], _netif.hwaddr[5] },
+		.sname = {0},
+		.file = {0},
+		.magic = htonl(DHCP_MAGIC),
+	};
+
+	memcpy(&buffer[offset], &bootp_out, sizeof(struct dhcp_packet));
+	offset += sizeof(struct dhcp_packet);
+
+	memcpy(&buffer[offset], &dhcp_options, sizeof(dhcp_options));
+	offset += sizeof(dhcp_options);
+
+	return offset;
+}
+
+
 static void parse_dns_response(fs_node_t * tty, void * last_packet) {
 	struct udp_packet * udp = (struct udp_packet *)last_packet;
 	uint16_t src_port = ntohs(udp->source_port);
@@ -1098,8 +1610,23 @@ static void parse_dns_response(fs_node_t * tty, void * last_packet) {
 		} else {
 			if (ntohs(d[0]) == 5) {
 				fprintf(tty, "CNAME: ");
-				print_dns_name(tty, dns, offset);
-				fprintf(tty, "\n");
+				char buffer[256];
+				get_dns_name(buffer, dns, offset);
+				fprintf(tty, "%s\n", buffer);
+				if (strlen(buffer)) {
+					buffer[strlen(buffer)-1] = '\0';
+				}
+				uint32_t addr;
+				if (gethost(buffer,&addr) == 2) {
+					debug_print(WARNING,"Can't provide a response yet, but going to query again in a moment.");
+				} else {
+					if (!hashmap_has(dns_cache, buf)) {
+						char ip[16];
+						ip_ntoa(addr, ip);
+						hashmap_set(dns_cache, buf, strdup(ip));
+						fprintf(tty, "resolves to %s\n", ip);
+					}
+				}
 			} else {
 				fprintf(tty, "dunno\n");
 			}

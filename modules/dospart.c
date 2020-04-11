@@ -1,13 +1,13 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2014 Kevin Lange
+ * Copyright (C) 2014-2018 K. Lange
  */
-#include <system.h>
-#include <logging.h>
-#include <module.h>
-#include <printf.h>
-#include <ata.h>
+#include <kernel/system.h>
+#include <kernel/logging.h>
+#include <kernel/module.h>
+#include <kernel/printf.h>
+#include <kernel/ata.h>
 
 #define SECTORSIZE      512
 
@@ -18,7 +18,7 @@ struct dos_partition_entry {
 	partition_t partition;
 };
 
-static uint32_t read_part(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+static uint32_t read_part(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer) {
 	struct dos_partition_entry * device = (struct dos_partition_entry *)node->device;
 
 	if (offset > device->partition.sector_count * SECTORSIZE) {
@@ -34,7 +34,7 @@ static uint32_t read_part(fs_node_t *node, uint32_t offset, uint32_t size, uint8
 	return read_fs(device->device, offset + device->partition.lba_first_sector * SECTORSIZE, size, buffer);
 }
 
-static uint32_t write_part(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+static uint32_t write_part(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer) {
 	struct dos_partition_entry * device = (struct dos_partition_entry *)node->device;
 
 	if (offset > device->partition.sector_count * SECTORSIZE) {
@@ -71,6 +71,7 @@ static fs_node_t * dospart_device_create(int i, fs_node_t * dev, partition_t * p
 	fnode->device  = device;
 	fnode->uid = 0;
 	fnode->gid = 0;
+	fnode->mask    = 0660;
 	fnode->length  = device->partition.sector_count * SECTORSIZE; /* TODO */
 	fnode->flags   = FS_BLOCKDEVICE;
 	fnode->read    = read_part;

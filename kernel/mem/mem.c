@@ -1,19 +1,20 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2011-2014 Kevin Lange
+ * Copyright (C) 2011-2018 K. Lange
  * Copyright (C) 2012 Markus Schober
  *
  * Kernel Memory Manager
  */
 
-#include <mem.h>
-#include <system.h>
-#include <process.h>
-#include <logging.h>
-#include <signal.h>
-#include <hashmap.h>
-#include <module.h>
+#include <kernel/mem.h>
+#include <kernel/system.h>
+#include <kernel/process.h>
+#include <kernel/logging.h>
+#include <kernel/signal.h>
+#include <kernel/module.h>
+
+#include <toaru/hashmap.h>
 
 #define KERNEL_HEAP_INIT 0x00800000
 #define KERNEL_HEAP_END  0x20000000
@@ -66,6 +67,7 @@ kmalloc_real(
 				for (unsigned int i = 0; i < (size + 0xFFF) / 0x1000; ++i) {
 					set_frame((index + i) * 0x1000);
 					page_t * page = get_page((uintptr_t)address + (i * 0x1000),0,kernel_directory);
+					ASSUME(page != NULL);
 					page->frame = index + i;
 					page->writethrough = 1;
 					page->cachedisable = 1;
@@ -77,7 +79,7 @@ kmalloc_real(
 		return (uintptr_t)address;
 	}
 
-	if (align && (placement_pointer & 0xFFFFF000)) {
+	if (align && (placement_pointer & 0x00000FFF)) {
 		placement_pointer &= 0xFFFFF000;
 		placement_pointer += 0x1000;
 	}
@@ -145,7 +147,7 @@ set_frame(
 		uint32_t frame  = frame_addr / 0x1000;
 		uint32_t index  = INDEX_FROM_BIT(frame);
 		uint32_t offset = OFFSET_FROM_BIT(frame);
-		frames[index] |= (0x1 << offset);
+		frames[index] |= ((uint32_t)0x1 << offset);
 	}
 }
 
@@ -156,14 +158,14 @@ clear_frame(
 	uint32_t frame  = frame_addr / 0x1000;
 	uint32_t index  = INDEX_FROM_BIT(frame);
 	uint32_t offset = OFFSET_FROM_BIT(frame);
-	frames[index] &= ~(0x1 << offset);
+	frames[index] &= ~((uint32_t)0x1 << offset);
 }
 
 uint32_t test_frame(uintptr_t frame_addr) {
 	uint32_t frame  = frame_addr / 0x1000;
 	uint32_t index  = INDEX_FROM_BIT(frame);
 	uint32_t offset = OFFSET_FROM_BIT(frame);
-	return (frames[index] & (0x1 << offset));
+	return (frames[index] & ((uint32_t)0x1 << offset));
 }
 
 uint32_t first_n_frames(int n) {
@@ -187,7 +189,7 @@ uint32_t first_frame(void) {
 	for (i = 0; i < INDEX_FROM_BIT(nframes); ++i) {
 		if (frames[i] != 0xFFFFFFFF) {
 			for (j = 0; j < 32; ++j) {
-				uint32_t testFrame = 0x1 << j;
+				uint32_t testFrame = (uint32_t)0x1 << j;
 				if (!(frames[i] & testFrame)) {
 					return i * 0x20 + j;
 				}
@@ -202,13 +204,6 @@ uint32_t first_frame(void) {
 		debug_video_crash(msgs);
 	}
 
-#if 0
-	signal_t * sig = malloc(sizeof(signal_t));
-	sig->handler = current_process->signals.functions[SIGSEGV];
-	sig->signum  = SIGSEGV;
-	handle_signal((process_t *)current_process, sig);
-#endif
-
 	STOP;
 
 	return -1;
@@ -220,6 +215,7 @@ alloc_frame(
 		int is_kernel,
 		int is_writeable
 		) {
+	ASSUME(page != NULL);
 	if (page->frame != 0) {
 		page->present = 1;
 		page->rw      = (is_writeable == 1) ? 1 : 0;
@@ -245,6 +241,7 @@ dma_frame(
 		int is_writeable,
 		uintptr_t address
 		) {
+	ASSUME(page != NULL);
 	/* Page this address directly */
 	page->present = 1;
 	page->rw      = (is_writeable) ? 1 : 0;
@@ -272,7 +269,7 @@ uintptr_t memory_use(void ) {
 	uint32_t i, j;
 	for (i = 0; i < INDEX_FROM_BIT(nframes); ++i) {
 		for (j = 0; j < 32; ++j) {
-			uint32_t testFrame = 0x1 << j;
+			uint32_t testFrame = (uint32_t)0x1 << j;
 			if (frames[i] & testFrame) {
 				ret++;
 			}
@@ -293,6 +290,17 @@ void paging_install(uint32_t memsize) {
 	uintptr_t phys;
 	kernel_directory = (page_directory_t *)kvmalloc_p(sizeof(page_directory_t),&phys);
 	memset(kernel_directory, 0, sizeof(page_directory_t));
+
+	/* Set PAT 111b to Write-Combining */
+	asm volatile (
+		"mov $0x277, %%ecx\n" /* IA32_MSR_PAT */
+		"rdmsr\n"
+		"or $0x1000000, %%edx\n" /* set bit 56 */
+		"and $0xf9ffffff, %%edx\n" /* unset bits 57, 58 */
+		"wrmsr\n"
+		: : : "ecx", "edx", "eax"
+	);
+
 }
 
 void paging_mark_system(uint64_t addr) {
@@ -338,6 +346,9 @@ void paging_finalize(void) {
 	/* And preallocate the page entries for all the rest of the kernel heap as well */
 	for (uintptr_t i = tmp_heap_start; i < KERNEL_HEAP_END; i += 0x1000) {
 		get_page(i, 1, kernel_directory);
+	}
+	for (unsigned int i = 0xE000; i <= 0xFFF0; i += 0x40) {
+		get_page(i << 16UL, 1, kernel_directory);
 	}
 
 	debug_print(NOTICE, "Setting directory.");
@@ -432,6 +443,7 @@ get_page(
 	} else if(make) {
 		uint32_t temp;
 		dir->tables[table_index] = (page_table_t *)kvmalloc_p(sizeof(page_table_t), (uintptr_t *)(&temp));
+		ASSUME(dir->tables[table_index] != NULL);
 		memset(dir->tables[table_index], 0, sizeof(page_table_t));
 		dir->physical_tables[table_index] = temp | 0x7; /* Present, R/w, User */
 		return &dir->tables[table_index]->pages[address % 1024];
@@ -443,6 +455,7 @@ get_page(
 void
 page_fault(
 		struct regs *r)  {
+	ASSUME(r != NULL);
 	uint32_t faulting_address;
 	asm volatile("mov %%cr2, %0" : "=r"(faulting_address));
 
@@ -480,13 +493,11 @@ page_fault(
 				size_t d;
 				if (a <= r->eip) {
 					d = r->eip - a;
-				} else {
-					d = a - r->eip;
-				}
-				if (d < distance) {
-					closest = key;
-					distance = d;
-					addr = a;
+					if (d < distance) {
+						closest = key;
+						distance = d;
+						addr = a;
+					}
 				}
 			}
 			free(hash_keys);
@@ -514,11 +525,7 @@ page_fault(
 
 #endif
 
-	signal_t * sig = malloc(sizeof(signal_t));
-	sig->handler = current_process->signals.functions[SIGSEGV];
-	sig->signum  = SIGSEGV;
-	handle_signal((process_t *)current_process, sig);
-
+	send_signal(current_process->id, SIGSEGV, 1);
 }
 
 /*
@@ -544,7 +551,9 @@ void * sbrk(uintptr_t increment) {
 		debug_print(INFO, "Hit the end of available kernel heap, going to allocate more (at 0x%x, want to be at 0x%x)", heap_end, heap_end + increment);
 		for (uintptr_t i = heap_end; i < heap_end + increment; i += 0x1000) {
 			debug_print(INFO, "Allocating frame at 0x%x...", i);
-			alloc_frame(get_page(i, 0, kernel_directory), 1, 0);
+			page_t * page = get_page(i, 0, kernel_directory);
+			assert(page && "Kernel heap allocation fault.");
+			alloc_frame(page, 1, 0);
 		}
 		invalidate_page_tables();
 		debug_print(INFO, "Done.");

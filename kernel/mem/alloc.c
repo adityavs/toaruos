@@ -1,6 +1,6 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  *
- * Kevin Lange's Slab Allocator
+ * klange's Slab Allocator
  *
  * Implemented for CS241, Fall 2010, machine problem 7
  * at the University of Illinois, Urbana-Champaign.
@@ -8,9 +8,9 @@
  * Overall competition winner for speed.
  * Well ranked in memory usage.
  *
- * Copyright (c) 2010 Kevin Lange.  All rights reserved.
+ * Copyright (c) 2010-2018 K. Lange.  All rights reserved.
  *
- * Developed by: Kevin Lange <lange7@acm.uiuc.edu>
+ * Developed by: K. Lange <klange@toaruos.org>
  *               Dave Majnemer <dmajnem2@acm.uiuc.edu>
  *               Assocation for Computing Machinery
  *               University of Illinois, Urbana-Champaign
@@ -102,7 +102,7 @@
 **/
 
 /* Includes {{{ */
-#include <system.h>
+#include <kernel/system.h>
 /* }}} */
 /* Definitions {{{ */
 
@@ -124,6 +124,44 @@
 
 /* }}} */
 
+//#define _DEBUG_MALLOC
+
+#ifdef _DEBUG_MALLOC
+#define EARLY_LOG_DEVICE 0x3F8
+static uint32_t _kmalloc_log_write(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer) {
+	for (unsigned int i = 0; i < size; ++i) {
+		outportb(EARLY_LOG_DEVICE, buffer[i]);
+	}
+	return size;
+}
+static fs_node_t _kmalloc_log = { .write = &_kmalloc_log_write };
+extern uintptr_t map_to_physical(uintptr_t virtual);
+
+#define HALT_ON(_addr) do { \
+		if ((uintptr_t)ptr == _addr) { \
+			IRQ_OFF; \
+			struct { \
+				char c; \
+				uint32_t addr; \
+				uint32_t size; \
+				uint32_t extra; \
+				uint32_t eip; \
+			} __attribute__((packed)) log = {'h',_addr,0,0,0}; \
+			write_fs(&_kmalloc_log, 0, sizeof(log), (uint8_t *)&log); \
+			while (1) {} \
+		} } while (0)
+
+#define STACK_TRACE(base)  \
+		uint32_t _eip = 0; \
+		unsigned int * ebp = (unsigned int *)(&(base) - 2); \
+		for (unsigned int frame = 0; frame < 1; ++frame) { \
+			unsigned int eip = ebp[1]; \
+			if (eip == 0) break; \
+			ebp = (unsigned int *)(ebp[0]); \
+			_eip = eip; \
+		}
+#endif
+
 /*
  * Internal functions.
  */
@@ -137,14 +175,56 @@ static spin_lock_t mem_lock =  { 0 };
 
 void * __attribute__ ((malloc)) malloc(uintptr_t size) {
 	spin_lock(mem_lock);
+#ifdef _DEBUG_MALLOC
+	size += 8;
+#endif
 	void * ret = klmalloc(size);
+#ifdef _DEBUG_MALLOC
+	STACK_TRACE(size);
+	if (ret) {
+		char * c = ret;
+		uintptr_t s = size-8;
+		memcpy(&c[size-4],&s,sizeof(uintptr_t));
+		s = 0xDEADBEEF;
+		memcpy(&c[size-8],&s,sizeof(uintptr_t));
+	}
+	struct {
+		char c;
+		uint32_t addr;
+		uint32_t size;
+		uint32_t extra;
+		uint32_t eip;
+	} __attribute__((packed)) log = {'m',(uint32_t)ret,size-8,0xDEADBEEF,_eip};
+	write_fs(&_kmalloc_log, 0, sizeof(log), (uint8_t *)&log);
+#endif
 	spin_unlock(mem_lock);
 	return ret;
 }
 
 void * __attribute__ ((malloc)) realloc(void * ptr, uintptr_t size) {
 	spin_lock(mem_lock);
+#ifdef _DEBUG_MALLOC
+	size += 8;
+#endif
 	void * ret = klrealloc(ptr, size);
+#ifdef _DEBUG_MALLOC
+	STACK_TRACE(ptr);
+	if (ret) {
+		char * c = ret;
+		uintptr_t s = size-8;
+		memcpy(&c[size-4],&s,sizeof(uintptr_t));
+		s = 0xDEADBEEF;
+		memcpy(&c[size-8],&s,sizeof(uintptr_t));
+	}
+	struct {
+		char c;
+		uint32_t addr;
+		uint32_t size;
+		uint32_t extra;
+		uint32_t eip;
+	} __attribute__((packed)) log = {'r',(uint32_t)ptr,size-8,(uint32_t)ret,_eip};
+	write_fs(&_kmalloc_log, 0, sizeof(log), (uint8_t *)&log);
+#endif
 	spin_unlock(mem_lock);
 	return ret;
 }
@@ -152,13 +232,44 @@ void * __attribute__ ((malloc)) realloc(void * ptr, uintptr_t size) {
 void * __attribute__ ((malloc)) calloc(uintptr_t nmemb, uintptr_t size) {
 	spin_lock(mem_lock);
 	void * ret = klcalloc(nmemb, size);
+#ifdef _DEBUG_MALLOC
+	struct {
+		char c;
+		uint32_t addr;
+		uint32_t size;
+		uint32_t extra;
+		uint32_t eip;
+	} __attribute__((packed)) log = {'c',(uint32_t)ret,size,nmemb,0};
+	write_fs(&_kmalloc_log, 0, sizeof(log), (uint8_t *)&log);
+#endif
 	spin_unlock(mem_lock);
 	return ret;
 }
 
 void * __attribute__ ((malloc)) valloc(uintptr_t size) {
 	spin_lock(mem_lock);
+#ifdef _DEBUG_MALLOC
+	size += 8;
+#endif
 	void * ret = klvalloc(size);
+#ifdef _DEBUG_MALLOC
+	STACK_TRACE(size);
+	if (ret) {
+		char * c = ret;
+		uintptr_t s = size-8;
+		memcpy(&c[size-4],&s,sizeof(uintptr_t));
+		s = 0xDEADBEEF;
+		memcpy(&c[size-8],&s,sizeof(uintptr_t));
+	}
+	struct {
+		char c;
+		uint32_t addr;
+		uint32_t size;
+		uint32_t extra;
+		uint32_t eip;
+	} __attribute__((packed)) log = {'v',(uint32_t)ret,size-8,0xDEADBEEF,_eip};
+	write_fs(&_kmalloc_log, 0, sizeof(log), (uint8_t *)&log);
+#endif
 	spin_unlock(mem_lock);
 	return ret;
 }
@@ -166,6 +277,42 @@ void * __attribute__ ((malloc)) valloc(uintptr_t size) {
 void free(void * ptr) {
 	spin_lock(mem_lock);
 	if ((uintptr_t)ptr > placement_pointer) {
+#ifdef _DEBUG_MALLOC
+		IRQ_OFF;
+
+		STACK_TRACE(ptr);
+
+		char * tag = ptr;
+		uintptr_t i = 0;
+		uint32_t * x;
+		int _failed = 1;
+		while (i < 0x40000) {
+			x = (uint32_t*)(tag + i);
+			if (map_to_physical((uintptr_t)x) == 0 || map_to_physical((uintptr_t)x + 8) == 0) {
+				x = (uint32_t *)tag;
+				break;
+			}
+			page_t * page = get_page((uintptr_t)x, 0, current_directory);
+			if (page->present != 1) break;
+			page = get_page((uintptr_t)x + 8, 0, current_directory);
+			if (page->present != 1) break;
+			if (*x == 0xDEADBEEF) {
+				if (x[1] == i) {
+					_failed = 0;
+					break;
+				}
+			}
+			i++;
+		}
+		struct {
+			char c;
+			uint32_t addr;
+			uint32_t size;
+			uint32_t extra;
+			uint32_t eip;
+		} __attribute__((packed)) log = {'f',(uint32_t)ptr,_failed ? 0xFFFFFFFF : x[1],_failed ? 0xFFFFFFFF : x[0],_eip};
+		write_fs(&_kmalloc_log, 0, sizeof(log), (uint8_t *)&log);
+#endif
 		klfree(ptr);
 	}
 	spin_unlock(mem_lock);
@@ -177,7 +324,7 @@ void free(void * ptr) {
 /*
  * Adjust bin size in bin_size call to proper bounds.
  */
-static uintptr_t  __attribute__ ((always_inline, pure)) klmalloc_adjust_bin(uintptr_t bin)
+inline static uintptr_t  __attribute__ ((always_inline, pure)) klmalloc_adjust_bin(uintptr_t bin)
 {
 	if (bin <= (uintptr_t)SMALLEST_BIN_LOG)
 	{
@@ -194,7 +341,7 @@ static uintptr_t  __attribute__ ((always_inline, pure)) klmalloc_adjust_bin(uint
  * Given a size value, find the correct bin
  * to place the requested allocation in.
  */
-static uintptr_t __attribute__ ((always_inline, pure)) klmalloc_bin_size(uintptr_t size) {
+inline static uintptr_t __attribute__ ((always_inline, pure)) klmalloc_bin_size(uintptr_t size) {
 	uintptr_t bin = sizeof(size) * CHAR_BIT - __builtin_clzl(size);
 	bin += !!(size & (size - 1));
 	return klmalloc_adjust_bin(bin);
@@ -255,7 +402,7 @@ static klmalloc_big_bin_header * klmalloc_newest_big = NULL;		/* Newest big bin 
  * position in the list by linking
  * its neighbors to eachother.
  */
-static void __attribute__ ((always_inline)) klmalloc_list_decouple(klmalloc_bin_header_head *head, klmalloc_bin_header *node) {
+inline static void __attribute__ ((always_inline)) klmalloc_list_decouple(klmalloc_bin_header_head *head, klmalloc_bin_header *node) {
 	klmalloc_bin_header *next	= node->next;
 	head->first = next;
 	node->next = NULL;
@@ -268,7 +415,7 @@ static void __attribute__ ((always_inline)) klmalloc_list_decouple(klmalloc_bin_
  * elements are updated to point back
  * to it (our list is doubly linked).
  */
-static void __attribute__ ((always_inline)) klmalloc_list_insert(klmalloc_bin_header_head *head, klmalloc_bin_header *node) {
+inline static void __attribute__ ((always_inline)) klmalloc_list_insert(klmalloc_bin_header_head *head, klmalloc_bin_header *node) {
 	node->next = head->first;
 	head->first = node;
 }
@@ -279,7 +426,7 @@ static void __attribute__ ((always_inline)) klmalloc_list_insert(klmalloc_bin_he
  * are really great, and just in case
  * we change the list implementation.
  */
-static klmalloc_bin_header * __attribute__ ((always_inline)) klmalloc_list_head(klmalloc_bin_header_head *head) {
+inline static klmalloc_bin_header * __attribute__ ((always_inline)) klmalloc_list_head(klmalloc_bin_header_head *head) {
 	return head->first;
 }
 
@@ -315,7 +462,7 @@ static uint32_t __attribute__ ((pure)) klmalloc_skip_rand(void) {
 /*
  * Generate a random level for a skip node
  */
-static int __attribute__ ((pure, always_inline)) klmalloc_random_level(void) {
+inline static int __attribute__ ((pure, always_inline)) klmalloc_random_level(void) {
 	int level = 0;
 	/*
 	 * Keep trying to check rand() against 50% of its maximum.
@@ -557,7 +704,7 @@ static void klmalloc_stack_push(klmalloc_bin_header *header, void *ptr) {
  * stack, so there is no more free
  * space available in the block.
  */
-static int __attribute__ ((always_inline)) klmalloc_stack_empty(klmalloc_bin_header *header) {
+inline static int __attribute__ ((always_inline)) klmalloc_stack_empty(klmalloc_bin_header *header) {
 	return header->head == NULL;
 }
 

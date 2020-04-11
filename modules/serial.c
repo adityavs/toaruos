@@ -1,18 +1,20 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2014 Kevin Lange
+ * Copyright (C) 2014-2018 K. Lange
  *
  * Serial communication device
  *
  */
 
-#include <system.h>
-#include <fs.h>
-#include <pipe.h>
-#include <logging.h>
-#include <args.h>
-#include <module.h>
+#include <kernel/system.h>
+#include <kernel/fs.h>
+#include <kernel/pipe.h>
+#include <kernel/logging.h>
+#include <kernel/args.h>
+#include <kernel/module.h>
+#include <kernel/pty.h>
+#include <kernel/printf.h>
 
 #define SERIAL_PORT_A 0x3F8
 #define SERIAL_PORT_B 0x2F8
@@ -22,74 +24,19 @@
 #define SERIAL_IRQ_AC 4
 #define SERIAL_IRQ_BD 3
 
-static char serial_recv(int device);
+static pty_t * _serial_port_pty_a = NULL;
+static pty_t * _serial_port_pty_b = NULL;
+static pty_t * _serial_port_pty_c = NULL;
+static pty_t * _serial_port_pty_d = NULL;
 
-static fs_node_t * _serial_port_a = NULL;
-static fs_node_t * _serial_port_b = NULL;
-static fs_node_t * _serial_port_c = NULL;
-static fs_node_t * _serial_port_d = NULL;
-
-static uint8_t convert(uint8_t in) {
-	switch (in) {
-		case 0x7F:
-			return 0x08;
-		case 0x0D:
-			return '\n';
-		default:
-			return in;
-	}
-}
-
-static fs_node_t ** pipe_for_port(int port) {
+static pty_t ** pty_for_port(int port) {
 	switch (port) {
-		case SERIAL_PORT_A: return &_serial_port_a;
-		case SERIAL_PORT_B: return &_serial_port_b;
-		case SERIAL_PORT_C: return &_serial_port_c;
-		case SERIAL_PORT_D: return &_serial_port_d;
+		case SERIAL_PORT_A: return &_serial_port_pty_a;
+		case SERIAL_PORT_B: return &_serial_port_pty_b;
+		case SERIAL_PORT_C: return &_serial_port_pty_c;
+		case SERIAL_PORT_D: return &_serial_port_pty_d;
 	}
-	return NULL;
-}
-
-static int serial_handler_ac(struct regs *r) {
-	char serial;
-	int  port = 0;
-	if (inportb(SERIAL_PORT_A+1) & 0x01) {
-		port = SERIAL_PORT_A;
-	} else {
-		port = SERIAL_PORT_C;
-	}
-	serial = serial_recv(port);
-	irq_ack(SERIAL_IRQ_AC);
-	uint8_t buf[] = {convert(serial), 0};
-	write_fs(*pipe_for_port(port), 0, 1, buf);
-	return 1;
-}
-
-static int serial_handler_bd(struct regs *r) {
-	char serial;
-	int  port = 0;
-	debug_print(NOTICE, "Received something on secondary port");
-	if (inportb(SERIAL_PORT_B+1) & 0x01) {
-		port = SERIAL_PORT_B;
-	} else {
-		port = SERIAL_PORT_D;
-	}
-	serial = serial_recv(port);
-	irq_ack(SERIAL_IRQ_BD);
-	uint8_t buf[] = {convert(serial), 0};
-	write_fs(*pipe_for_port(port), 0, 1, buf);
-	return 1;
-}
-
-static void serial_enable(int port) {
-	outportb(port + 1, 0x00); /* Disable interrupts */
-	outportb(port + 3, 0x80); /* Enable divisor mode */
-	outportb(port + 0, 0x01); /* Div Low:  01 Set the port to 115200 bps */
-	outportb(port + 1, 0x00); /* Div High: 00 */
-	outportb(port + 3, 0x03); /* Disable divisor mode, set parity */
-	outportb(port + 2, 0xC7); /* Enable FIFO and clear */
-	outportb(port + 4, 0x0B); /* Enable interrupts */
-	outportb(port + 1, 0x01); /* Enable interrupts */
+	__builtin_unreachable();
 }
 
 static int serial_rcvd(int device) {
@@ -110,89 +57,117 @@ static void serial_send(int device, char out) {
 	outportb(device, out);
 }
 
-static void serial_string(char * out) {
-	for (uint32_t i = 0; i < strlen(out); ++i) {
-		serial_send(SERIAL_PORT_A, out[i]);
-	}
-}
-
-static uint32_t read_serial(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer);
-static uint32_t write_serial(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer);
-static void open_serial(fs_node_t *node, unsigned int flags);
-static void close_serial(fs_node_t *node);
-
-static uint32_t read_serial(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
-	return read_fs(*pipe_for_port((int)node->device), offset, size, buffer);
-}
-
-static uint32_t write_serial(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
-	uint32_t sent = 0;
-	while (sent < size) {
-		serial_send((int)node->device, buffer[sent]);
-		sent++;
-	}
-	return size;
-}
-
-static void open_serial(fs_node_t * node, unsigned int flags) {
-	return;
-}
-
-static void close_serial(fs_node_t * node) {
-	return;
-}
-
-static fs_node_t * serial_device_create(int device) {
-	fs_node_t * fnode = malloc(sizeof(fs_node_t));
-	memset(fnode, 0x00, sizeof(fs_node_t));
-	fnode->device= (void *)device;
-	strcpy(fnode->name, "serial");
-	fnode->uid = 0;
-	fnode->gid = 0;
-	fnode->flags   = FS_CHARDEVICE;
-	fnode->read    = read_serial;
-	fnode->write   = write_serial;
-	fnode->open    = open_serial;
-	fnode->close   = close_serial;
-	fnode->readdir = NULL;
-	fnode->finddir = NULL;
-	fnode->ioctl   = NULL; /* TODO ioctls for raw serial devices */
-
-	fnode->atime = now();
-	fnode->mtime = fnode->atime;
-	fnode->ctime = fnode->atime;
-
-	serial_enable(device);
-
-	if (device == SERIAL_PORT_A || device == SERIAL_PORT_C) {
-		irq_install_handler(SERIAL_IRQ_AC, serial_handler_ac);
+static int serial_handler_ac(struct regs *r) {
+	char serial;
+	int  port = 0;
+	if (inportb(SERIAL_PORT_A+1) & 0x01) {
+		port = SERIAL_PORT_A;
 	} else {
-		irq_install_handler(SERIAL_IRQ_BD, serial_handler_bd);
+		port = SERIAL_PORT_C;
+	}
+	serial = serial_recv(port);
+	irq_ack(SERIAL_IRQ_AC);
+	tty_input_process(*pty_for_port(port), serial);
+	return 1;
+}
+
+static int serial_handler_bd(struct regs *r) {
+	char serial;
+	int  port = 0;
+	debug_print(NOTICE, "Received something on secondary port");
+	if (inportb(SERIAL_PORT_B+1) & 0x01) {
+		port = SERIAL_PORT_B;
+	} else {
+		port = SERIAL_PORT_D;
+	}
+	serial = serial_recv(port);
+	irq_ack(SERIAL_IRQ_BD);
+	tty_input_process(*pty_for_port(port), serial);
+	return 1;
+}
+
+static void serial_enable(int port) {
+	outportb(port + 1, 0x00); /* Disable interrupts */
+	outportb(port + 3, 0x80); /* Enable divisor mode */
+	outportb(port + 0, 0x01); /* Div Low:  01 Set the port to 115200 bps */
+	outportb(port + 1, 0x00); /* Div High: 00 */
+	outportb(port + 3, 0x03); /* Disable divisor mode, set parity */
+	outportb(port + 2, 0xC7); /* Enable FIFO and clear */
+	outportb(port + 4, 0x0B); /* Enable interrupts */
+	outportb(port + 1, 0x01); /* Enable interrupts */
+}
+
+static int have_installed_ac = 0;
+static int have_installed_bd = 0;
+
+static void serial_write_out(pty_t * pty, uint8_t c) {
+	if (pty == _serial_port_pty_a) serial_send(SERIAL_PORT_A, c);
+	if (pty == _serial_port_pty_b) serial_send(SERIAL_PORT_B, c);
+	if (pty == _serial_port_pty_c) serial_send(SERIAL_PORT_C, c);
+	if (pty == _serial_port_pty_d) serial_send(SERIAL_PORT_D, c);
+}
+
+#define DEV_PATH "/dev/"
+#define TTY_A "ttyS0"
+#define TTY_B "ttyS1"
+#define TTY_C "ttyS2"
+#define TTY_D "ttyS3"
+
+static void serial_fill_name(pty_t * pty, char * name) {
+	if (pty == _serial_port_pty_a) sprintf(name, DEV_PATH TTY_A);
+	if (pty == _serial_port_pty_b) sprintf(name, DEV_PATH TTY_B);
+	if (pty == _serial_port_pty_c) sprintf(name, DEV_PATH TTY_C);
+	if (pty == _serial_port_pty_d) sprintf(name, DEV_PATH TTY_D);
+}
+
+static fs_node_t * serial_device_create(int port) {
+	pty_t * pty = pty_new(NULL);
+	*pty_for_port(port) = pty;
+	pty->write_out = serial_write_out;
+	pty->fill_name = serial_fill_name;
+
+	serial_enable(port);
+
+	if (port == SERIAL_PORT_A || port == SERIAL_PORT_C) {
+		if (!have_installed_ac) {
+			irq_install_handler(SERIAL_IRQ_AC, serial_handler_ac, "serial ac");
+			have_installed_ac = 1;
+		}
+	} else {
+		if (!have_installed_bd) {
+			irq_install_handler(SERIAL_IRQ_BD, serial_handler_bd, "serial bd");
+			have_installed_bd = 1;
+		}
 	}
 
-	*pipe_for_port(device) = make_pipe(128);
-
-	return fnode;
+	return pty->slave;
 }
 
 static int serial_mount_devices(void) {
 
-	fs_node_t * ttyS0 = serial_device_create(SERIAL_PORT_A);
-	vfs_mount("/dev/ttyS0", ttyS0);
-
-	fs_node_t * ttyS1 = serial_device_create(SERIAL_PORT_B);
-	vfs_mount("/dev/ttyS1", ttyS1);
-
-	fs_node_t * ttyS2 = serial_device_create(SERIAL_PORT_C);
-	vfs_mount("/dev/ttyS2", ttyS2);
-
-	fs_node_t * ttyS3 = serial_device_create(SERIAL_PORT_D);
-	vfs_mount("/dev/ttyS3", ttyS3);
+	fs_node_t * ttyS0 = serial_device_create(SERIAL_PORT_A); vfs_mount(DEV_PATH TTY_A, ttyS0);
+	fs_node_t * ttyS1 = serial_device_create(SERIAL_PORT_B); vfs_mount(DEV_PATH TTY_B, ttyS1);
+	fs_node_t * ttyS2 = serial_device_create(SERIAL_PORT_C); vfs_mount(DEV_PATH TTY_C, ttyS2);
+	fs_node_t * ttyS3 = serial_device_create(SERIAL_PORT_D); vfs_mount(DEV_PATH TTY_D, ttyS3);
 
 	char * c;
 	if ((c = args_value("logtoserial"))) {
 		debug_file = ttyS0;
-		debug_level = atoi(c);
+		if (!strcmp(c,"INFO") || !strcmp(c,"info")) {
+			debug_level = INFO;
+		} else if (!strcmp(c,"NOTICE") || !strcmp(c,"notice")) {
+			debug_level = NOTICE;
+		} else if (!strcmp(c,"WARNING") || !strcmp(c,"warning")) {
+			debug_level = WARNING;
+		} else if (!strcmp(c,"ERROR") || !strcmp(c,"error")) {
+			debug_level = ERROR;
+		} else if (!strcmp(c,"CRITICAL") || !strcmp(c,"critical")) {
+			debug_level = CRITICAL;
+		} else if (!strcmp(c,"INSANE") || !strcmp(c,"insane")) {
+			debug_level = INSANE;
+		} else {
+			debug_level = atoi(c);
+		}
 		debug_print(NOTICE, "Serial logging enabled at level %d.", debug_level);
 	}
 

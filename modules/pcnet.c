@@ -1,17 +1,18 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2016 Kevin Lange
+ * Copyright (C) 2016-2018 K. Lange
  */
-#include <module.h>
-#include <logging.h>
-#include <printf.h>
-#include <pci.h>
-#include <mem.h>
-#include <list.h>
-#include <pipe.h>
-#include <ipv4.h>
-#include <mod/net.h>
+#include <kernel/module.h>
+#include <kernel/logging.h>
+#include <kernel/printf.h>
+#include <kernel/pci.h>
+#include <kernel/mem.h>
+#include <kernel/pipe.h>
+#include <kernel/ipv4.h>
+#include <kernel/mod/net.h>
+
+#include <toaru/list.h>
 
 static list_t * net_queue = NULL;
 static spin_lock_t net_queue_lock = { 0 };
@@ -208,8 +209,8 @@ static void pcnet_init(void * data, char * name) {
 	pcnet_io_base  = pci_read_field(pcnet_device_pci, PCI_BAR0, 4) & 0xFFFFFFF0;
 	pcnet_mem_base = pci_read_field(pcnet_device_pci, PCI_BAR1, 4) & 0xFFFFFFF0;
 
-	pcnet_irq = pci_read_field(pcnet_device_pci, PCI_INTERRUPT_LINE, 1);
-	irq_install_handler(pcnet_irq, pcnet_irq_handler);
+	pcnet_irq = pci_get_interrupt(pcnet_device_pci);
+	irq_install_handler(pcnet_irq, pcnet_irq_handler, "pcnet");
 
 	debug_print(NOTICE, "irq line: %d", pcnet_irq);
 	debug_print(NOTICE, "io base: 0x%x", pcnet_io_base);
@@ -249,10 +250,6 @@ static void pcnet_init(void * data, char * name) {
 
 	debug_print(NOTICE, "device mac %2x:%2x:%2x:%2x:%2x:%2x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-	/* Initialize ring buffers */
-	debug_print(WARNING, "Request a large continuous chunk of memory.");
-	/* This fits 32x1548 (rx) + 8x1548 (tx) + 32x16 (rx DE) + 8x16 (tx DE) */
-	pcnet_buffer_virt = (void*)kvmalloc_p(0x10000, &pcnet_buffer_phys);
 	if (!pcnet_buffer_virt) {
 		debug_print(ERROR, "Failed.");
 		return;
@@ -326,8 +323,17 @@ static void pcnet_init(void * data, char * name) {
 
 	write_csr32(0, read_csr32(0) | (1 << 0) | (1 << 6)); /* do it */
 
-	while ((read_csr32(0) & (1 << 8)) == 0) {
-		/* herp */
+	uint64_t start_time;
+	asm volatile (".byte 0x0f, 0x31" : "=A" (start_time));
+
+	uint32_t status;
+	while (((status = read_csr32(0)) & (1 << 8)) == 0) {
+		uint64_t now_time;
+		asm volatile (".byte 0x0f, 0x31" : "=A" (now_time));
+		if (now_time - start_time > 0x10000) {
+			debug_print(ERROR, "Could not initialize PCNet card, status is 0x%4x", status);
+			return;
+		}
 	}
 
 	/* Start card */
@@ -339,8 +345,7 @@ static void pcnet_init(void * data, char * name) {
 
 	debug_print(NOTICE, "Card start.");
 
-	init_netif_funcs(pcnet_get_mac, dequeue_packet, pcnet_send_packet);
-	create_kernel_tasklet(net_handler, "[eth]", NULL);
+	init_netif_funcs(pcnet_get_mac, dequeue_packet, pcnet_send_packet, "AMD PCnet FAST II/III");
 
 }
 
@@ -351,6 +356,12 @@ static int init(void) {
 		debug_print(WARNING, "No PCNET device found.");
 		return 1;
 	}
+
+	/* Initialize ring buffers */
+	debug_print(WARNING, "Request a large continuous chunk of memory.");
+	/* This fits 32x1548 (rx) + 8x1548 (tx) + 32x16 (rx DE) + 8x16 (tx DE) */
+	pcnet_buffer_virt = (void*)kvmalloc_p(0x10000, &pcnet_buffer_phys);
+
 	create_kernel_tasklet(pcnet_init, "[pcnet]", NULL);
 
 	return 0;

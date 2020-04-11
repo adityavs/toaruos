@@ -1,24 +1,24 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2014 Kevin Lange
+ * Copyright (C) 2014-2018 K. Lange
   *
  * ATA Disk Driver
  *
  * Provides raw block access to an (Parallel) ATA drive.
  */
 
-#include <system.h>
-#include <logging.h>
-#include <module.h>
-#include <fs.h>
-#include <printf.h>
-#include <list.h>
-
-#include <pci.h>
+#include <kernel/system.h>
+#include <kernel/logging.h>
+#include <kernel/module.h>
+#include <kernel/fs.h>
+#include <kernel/printf.h>
+#include <kernel/pci.h>
 
 /* TODO: Move this to mod/ata.h */
-#include <ata.h>
+#include <kernel/ata.h>
+
+#include <toaru/list.h>
 
 static char ata_drive_char = 'a';
 static int  cdrom_number = 0;
@@ -70,11 +70,11 @@ static spin_lock_t ata_lock = { 0 };
 /* TODO support other sector sizes */
 #define ATA_SECTOR_SIZE 512
 
-static void ata_device_read_sector(struct ata_device * dev, uint32_t lba, uint8_t * buf);
-static void ata_device_read_sector_atapi(struct ata_device * dev, uint32_t lba, uint8_t * buf);
-static void ata_device_write_sector_retry(struct ata_device * dev, uint32_t lba, uint8_t * buf);
-static uint32_t read_ata(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer);
-static uint32_t write_ata(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer);
+static void ata_device_read_sector(struct ata_device * dev, uint64_t lba, uint8_t * buf);
+static void ata_device_read_sector_atapi(struct ata_device * dev, uint64_t lba, uint8_t * buf);
+static void ata_device_write_sector_retry(struct ata_device * dev, uint64_t lba, uint8_t * buf);
+static uint32_t read_ata(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer);
+static uint32_t write_ata(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer);
 static void     open_ata(fs_node_t *node, unsigned int flags);
 static void     close_ata(fs_node_t *node);
 
@@ -96,14 +96,20 @@ static uint64_t atapi_max_offset(struct ata_device * dev) {
 	return (max_sector + 1) * dev->atapi_sector_size;
 }
 
-static uint32_t read_ata(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+static uint32_t read_ata(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer) {
 
 	struct ata_device * dev = (struct ata_device *)node->device;
+
+#if 0
+	debug_print(ERROR, "ATA read at offset 0x%8x%8x", (uint32_t)(offset >> 32), (uint32_t)(offset & 0xFFFFFFFF));
+	debug_print(ERROR, "read size is 0x%8x", size);
+#endif
 
 	unsigned int start_block = offset / ATA_SECTOR_SIZE;
 	unsigned int end_block = (offset + size - 1) / ATA_SECTOR_SIZE;
 
 	unsigned int x_offset = 0;
+
 
 	if (offset > ata_max_offset(dev)) {
 		return 0;
@@ -114,12 +120,13 @@ static uint32_t read_ata(fs_node_t *node, uint32_t offset, uint32_t size, uint8_
 		size = i;
 	}
 
-	if (offset % ATA_SECTOR_SIZE) {
+	if (offset % ATA_SECTOR_SIZE || size < ATA_SECTOR_SIZE) {
 		unsigned int prefix_size = (ATA_SECTOR_SIZE - (offset % ATA_SECTOR_SIZE));
+		if (prefix_size > size) prefix_size = size;
 		char * tmp = malloc(ATA_SECTOR_SIZE);
 		ata_device_read_sector(dev, start_block, (uint8_t *)tmp);
 
-		memcpy(buffer, (void *)((uintptr_t)tmp + (offset % ATA_SECTOR_SIZE)), prefix_size);
+		memcpy(buffer, (void *)((uintptr_t)tmp + ((uintptr_t)offset % ATA_SECTOR_SIZE)), prefix_size);
 
 		free(tmp);
 
@@ -148,7 +155,7 @@ static uint32_t read_ata(fs_node_t *node, uint32_t offset, uint32_t size, uint8_
 	return size;
 }
 
-static uint32_t read_atapi(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+static uint32_t read_atapi(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer) {
 
 	struct ata_device * dev = (struct ata_device *)node->device;
 
@@ -166,12 +173,13 @@ static uint32_t read_atapi(fs_node_t *node, uint32_t offset, uint32_t size, uint
 		size = i;
 	}
 
-	if (offset % dev->atapi_sector_size) {
+	if (offset % dev->atapi_sector_size || size < dev->atapi_sector_size) {
 		unsigned int prefix_size = (dev->atapi_sector_size - (offset % dev->atapi_sector_size));
+		if (prefix_size > size) prefix_size = size;
 		char * tmp = malloc(dev->atapi_sector_size);
 		ata_device_read_sector_atapi(dev, start_block, (uint8_t *)tmp);
 
-		memcpy(buffer, (void *)((uintptr_t)tmp + (offset % dev->atapi_sector_size)), prefix_size);
+		memcpy(buffer, (void *)((uintptr_t)tmp + ((uintptr_t)offset % dev->atapi_sector_size)), prefix_size);
 
 		free(tmp);
 
@@ -201,13 +209,19 @@ static uint32_t read_atapi(fs_node_t *node, uint32_t offset, uint32_t size, uint
 }
 
 
-static uint32_t write_ata(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+static uint32_t write_ata(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer) {
 	struct ata_device * dev = (struct ata_device *)node->device;
 
 	unsigned int start_block = offset / ATA_SECTOR_SIZE;
 	unsigned int end_block = (offset + size - 1) / ATA_SECTOR_SIZE;
 
 	unsigned int x_offset = 0;
+
+#if 0
+	debug_print(ERROR, "ATA write at offset 0x%8x%8x", (uint32_t)(offset >> 32), (uint32_t)(offset & 0xFFFFFFFF));
+	debug_print(ERROR, "write size is 0x%8x", size);
+	debug_print(ERROR, "some data from buf: [%2x %2x %2x %2x]", buffer[0], buffer[1], buffer[2], buffer[3]);
+#endif
 
 	if (offset > ata_max_offset(dev)) {
 		return 0;
@@ -226,7 +240,7 @@ static uint32_t write_ata(fs_node_t *node, uint32_t offset, uint32_t size, uint8
 
 		debug_print(NOTICE, "Writing first block");
 
-		memcpy((void *)((uintptr_t)tmp + (offset % ATA_SECTOR_SIZE)), buffer, prefix_size);
+		memcpy((void *)((uintptr_t)tmp + ((uintptr_t)offset % ATA_SECTOR_SIZE)), buffer, prefix_size);
 		ata_device_write_sector_retry(dev, start_block, (uint8_t *)tmp);
 
 		free(tmp);
@@ -275,6 +289,7 @@ static fs_node_t * atapi_device_create(struct ata_device * device) {
 	fnode->device  = device;
 	fnode->uid = 0;
 	fnode->gid = 0;
+	fnode->mask    = 0664;
 	fnode->length  = atapi_max_offset(device);
 	fnode->flags   = FS_BLOCKDEVICE;
 	fnode->read    = read_atapi;
@@ -296,6 +311,7 @@ static fs_node_t * ata_device_create(struct ata_device * device) {
 	fnode->device  = device;
 	fnode->uid = 0;
 	fnode->gid = 0;
+	fnode->mask    = 0660;
 	fnode->length  = ata_max_offset(device); /* TODO */
 	fnode->flags   = FS_BLOCKDEVICE;
 	fnode->read    = read_ata;
@@ -449,7 +465,7 @@ static void ata_device_init(struct ata_device * dev) {
 
 }
 
-static void atapi_device_init(struct ata_device * dev) {
+static int atapi_device_init(struct ata_device * dev) {
 
 	dev->is_atapi = 1;
 
@@ -520,6 +536,7 @@ static void atapi_device_init(struct ata_device * dev) {
 		uint8_t status = inportb(dev->io_base + ATA_REG_STATUS);
 		if ((status & ATA_SR_ERR)) goto atapi_error_read;
 		if (!(status & ATA_SR_BSY) && (status & ATA_SR_DRDY)) break;
+		if ((status & ATA_SR_DRQ)) break;
 	}
 
 	uint16_t data[4];
@@ -538,16 +555,18 @@ static void atapi_device_init(struct ata_device * dev) {
 	dev->atapi_lba = lba;
 	dev->atapi_sector_size = blocks;
 
+	if (!lba) return 1;
+
 	debug_print(WARNING, "Finished! LBA = %x; block length = %x", lba, blocks);
-	return;
+	return 0;
 
 atapi_error_read:
 	debug_print(ERROR, "ATAPI error; no medium?");
-	return;
+	return 1;
 
 atapi_error:
 	debug_print(ERROR, "ATAPI early error; unsure");
-	return;
+	return 1;
 
 }
 
@@ -574,10 +593,10 @@ static int ata_device_detect(struct ata_device * dev) {
 		sprintf((char *)&devname, "/dev/hd%c", ata_drive_char);
 		fs_node_t * node = ata_device_create(dev);
 		vfs_mount(devname, node);
-		ata_drive_char++;
-
 		ata_device_init(dev);
+		node->length  = ata_max_offset(dev);
 
+		ata_drive_char++;
 		return 1;
 	} else if ((cl == 0x14 && ch == 0xEB) ||
 	           (cl == 0x69 && ch == 0x96)) {
@@ -586,7 +605,9 @@ static int ata_device_detect(struct ata_device * dev) {
 		char devname[64];
 		sprintf((char *)&devname, "/dev/cdrom%d", cdrom_number);
 
-		atapi_device_init(dev);
+		if (atapi_device_init(dev)) {
+			return 0;
+		}
 		fs_node_t * node = atapi_device_create(dev);
 		vfs_mount(devname, node);
 
@@ -599,11 +620,17 @@ static int ata_device_detect(struct ata_device * dev) {
 	return 0;
 }
 
-static void ata_device_read_sector(struct ata_device * dev, uint32_t lba, uint8_t * buf) {
+static void ata_device_read_sector(struct ata_device * dev, uint64_t lba, uint8_t * buf) {
 	uint16_t bus = dev->io_base;
 	uint8_t slave = dev->slave;
 
 	if (dev->is_atapi) return;
+
+#if 0
+	debug_print(ERROR, "Request to read sector %8x%8x",
+			(uint32_t)(lba >> 32),
+			(uint32_t)(lba & 0xFFFFFFFF));
+#endif
 
 	spin_lock(ata_lock);
 
@@ -633,13 +660,20 @@ try_again:
 	}
 
 	outportb(bus + ATA_REG_CONTROL, 0x00);
-	outportb(bus + ATA_REG_HDDEVSEL, 0xe0 | slave << 4 | (lba & 0x0f000000) >> 24);
+	outportb(bus + ATA_REG_HDDEVSEL, 0xe0 | slave << 4);
 	ata_io_wait(dev);
 	outportb(bus + ATA_REG_FEATURES, 0x00);
+
+	outportb(bus + ATA_REG_SECCOUNT0, 0);
+	outportb(bus + ATA_REG_LBA0, (lba & 0xff000000) >> 24);
+	outportb(bus + ATA_REG_LBA1, (lba & 0xff00000000) >> 32);
+	outportb(bus + ATA_REG_LBA2, (lba & 0xff0000000000) >> 40);
+
 	outportb(bus + ATA_REG_SECCOUNT0, 1);
 	outportb(bus + ATA_REG_LBA0, (lba & 0x000000ff) >>  0);
 	outportb(bus + ATA_REG_LBA1, (lba & 0x0000ff00) >>  8);
 	outportb(bus + ATA_REG_LBA2, (lba & 0x00ff0000) >> 16);
+
 	//outportb(bus + ATA_REG_COMMAND, ATA_CMD_READ_PIO);
 #if 1
 	while (1) {
@@ -647,7 +681,7 @@ try_again:
 		if (!(status & ATA_SR_BSY) && (status & ATA_SR_DRDY)) break;
 	}
 #endif
-	outportb(bus + ATA_REG_COMMAND, ATA_CMD_READ_DMA);
+	outportb(bus + ATA_REG_COMMAND, ATA_CMD_READ_DMA_EXT);
 
 	ata_io_wait(dev);
 
@@ -693,7 +727,7 @@ try_again:
 	spin_unlock(ata_lock);
 }
 
-static void ata_device_read_sector_atapi(struct ata_device * dev, uint32_t lba, uint8_t * buf) {
+static void ata_device_read_sector_atapi(struct ata_device * dev, uint64_t lba, uint8_t * buf) {
 
 	if (!dev->is_atapi) return;
 
@@ -764,24 +798,38 @@ atapi_error_on_read_setup:
 
 }
 
-static void ata_device_write_sector(struct ata_device * dev, uint32_t lba, uint8_t * buf) {
+static void ata_device_write_sector(struct ata_device * dev, uint64_t lba, uint8_t * buf) {
 	uint16_t bus = dev->io_base;
 	uint8_t slave = dev->slave;
+
+#if 0
+	debug_print(ERROR, "Request to write sector %8x%8x",
+			(uint32_t)(lba >> 32),
+			(uint32_t)(lba & 0xFFFFFFFF));
+	debug_print(ERROR, "Some data from buf: [%2x %2x %2x %2x]", buf[0], buf[1], buf[2], buf[3]);
+#endif
 
 	spin_lock(ata_lock);
 
 	outportb(bus + ATA_REG_CONTROL, 0x02);
 
 	ata_wait(dev, 0);
-	outportb(bus + ATA_REG_HDDEVSEL, 0xe0 | slave << 4 | (lba & 0x0f000000) >> 24);
+	outportb(bus + ATA_REG_HDDEVSEL, 0xe0 | slave << 4);
 	ata_wait(dev, 0);
 
 	outportb(bus + ATA_REG_FEATURES, 0x00);
-	outportb(bus + ATA_REG_SECCOUNT0, 0x01);
+
+	outportb(bus + ATA_REG_SECCOUNT0, 0);
+	outportb(bus + ATA_REG_LBA0, (lba & 0xff000000) >> 24);
+	outportb(bus + ATA_REG_LBA1, (lba & 0xff00000000) >> 32);
+	outportb(bus + ATA_REG_LBA2, (lba & 0xff0000000000) >> 40);
+
+	outportb(bus + ATA_REG_SECCOUNT0, 1);
 	outportb(bus + ATA_REG_LBA0, (lba & 0x000000ff) >>  0);
 	outportb(bus + ATA_REG_LBA1, (lba & 0x0000ff00) >>  8);
 	outportb(bus + ATA_REG_LBA2, (lba & 0x00ff0000) >> 16);
-	outportb(bus + ATA_REG_COMMAND, ATA_CMD_WRITE_PIO);
+
+	outportb(bus + ATA_REG_COMMAND, ATA_CMD_WRITE_PIO_EXT);
 	ata_wait(dev, 0);
 	int size = ATA_SECTOR_SIZE / 2;
 	outportsm(bus,buf,size);
@@ -802,7 +850,9 @@ static int buffer_compare(uint32_t * ptr1, uint32_t * ptr2, size_t size) {
 	return 0;
 }
 
-static void ata_device_write_sector_retry(struct ata_device * dev, uint32_t lba, uint8_t * buf) {
+static void ata_device_write_sector_retry(struct ata_device * dev, uint64_t lba, uint8_t * buf) {
+	uint64_t sectors = dev->identity.sectors_48;
+	if (lba >= sectors) return;
 	uint8_t * read_buf = malloc(ATA_SECTOR_SIZE);
 	do {
 		ata_device_write_sector(dev, lba, buf);
@@ -817,8 +867,8 @@ static int ata_initialize(void) {
 	/* Locate ATA device via PCI */
 	pci_scan(&find_ata_pci, -1, &ata_pci);
 
-	irq_install_handler(14, ata_irq_handler);
-	irq_install_handler(15, ata_irq_handler_s);
+	irq_install_handler(14, ata_irq_handler, "ide master");
+	irq_install_handler(15, ata_irq_handler_s, "ide slave");
 
 	atapi_waiter = list_create();
 

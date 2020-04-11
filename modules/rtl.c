@@ -1,17 +1,18 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2014 Kevin Lange
+ * Copyright (C) 2014-2018 K. Lange
  */
-#include <module.h>
-#include <logging.h>
-#include <printf.h>
-#include <pci.h>
-#include <mem.h>
-#include <list.h>
-#include <pipe.h>
-#include <ipv4.h>
-#include <mod/net.h>
+#include <kernel/module.h>
+#include <kernel/logging.h>
+#include <kernel/printf.h>
+#include <kernel/pci.h>
+#include <kernel/mem.h>
+#include <kernel/pipe.h>
+#include <kernel/ipv4.h>
+#include <kernel/mod/net.h>
+
+#include <toaru/list.h>
 
 /* XXX move this to ipv4? */
 extern size_t print_dns_name(fs_node_t * tty, struct dns_packet * dns, size_t offset);
@@ -301,9 +302,9 @@ int init_rtl(void) {
 			debug_print(NOTICE, "COMMAND register after:  0x%4x\n", command_reg);
 		}
 
-		rtl_irq = pci_read_field(rtl_device_pci, PCI_INTERRUPT_LINE, 1);
+		rtl_irq = pci_get_interrupt(rtl_device_pci);
 		debug_print(NOTICE, "Interrupt Line: %x\n", rtl_irq);
-		irq_install_handler(rtl_irq, rtl_irq_handler);
+		irq_install_handler(rtl_irq, rtl_irq_handler, "rtl8139");
 
 		uint32_t rtl_bar0 = pci_read_field(rtl_device_pci, PCI_BAR0, 4);
 		uint32_t rtl_bar1 = pci_read_field(rtl_device_pci, PCI_BAR1, 4);
@@ -393,9 +394,7 @@ int init_rtl(void) {
 		net_queue = list_create();
 
 		debug_print(NOTICE, "Initializing netif functions\n");
-		init_netif_funcs(rtl_get_mac, rtl_get_packet, rtl_send_packet);
-		debug_print(NOTICE, "Card is configured, going to start worker thread now.\n");
-		create_kernel_tasklet(net_handler, "[eth]", NULL);
+		init_netif_funcs(rtl_get_mac, rtl_get_packet, rtl_send_packet, "RTL8139");
 
 		debug_print(NOTICE, "Back from starting the worker thread.\n");
 	} else {
@@ -407,7 +406,7 @@ int init_rtl(void) {
 static int init(void) {
 	pci_scan(&find_rtl, -1, &rtl_device_pci);
 	if (!rtl_device_pci) {
-		debug_print(ERROR, "No RTL 8139 found?");
+		debug_print(NOTICE, "No RTL 8139 found");
 		return 1;
 	}
 	init_rtl();

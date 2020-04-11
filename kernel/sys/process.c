@@ -1,7 +1,7 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2011-2014 Kevin Lange
+ * Copyright (C) 2011-2018 K. Lange
  * Copyright (C) 2012 Markus Schober
  * Copyright (C) 2015 Dale Weiler
  *
@@ -10,14 +10,17 @@
  * Internal format format for a process and functions to spawn
  * new processes and manage the process tree.
  */
-#include <system.h>
-#include <process.h>
-#include <tree.h>
-#include <list.h>
-#include <bitset.h>
-#include <logging.h>
-#include <shm.h>
-#include <printf.h>
+#include <kernel/system.h>
+#include <kernel/process.h>
+#include <kernel/bitset.h>
+#include <kernel/logging.h>
+#include <kernel/shm.h>
+#include <kernel/printf.h>
+
+#include <sys/wait.h>
+
+#include <toaru/list.h>
+#include <toaru/tree.h>
 
 tree_t * process_tree;  /* Parent->Children tree */
 list_t * process_list;  /* Flat storage */
@@ -35,6 +38,16 @@ static bitset_t pid_set;
 
 /* Default process name string */
 char * default_name = "[unnamed]";
+
+int is_valid_process(process_t * process) {
+	foreach(lnode, process_list) {
+		if (lnode->value == process) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
 
 /*
  * This makes a nice 4096-byte bitmap. It also happens
@@ -111,6 +124,13 @@ process_t * next_ready_process(void) {
 	if (!process_available()) {
 		return kernel_idle_task;
 	}
+	if (process_queue->head->owner != process_queue) {
+		debug_print(ERROR, "Erroneous process located in process queue: node 0x%x has owner 0x%x, but process_queue is 0x%x", process_queue->head, process_queue->head->owner, process_queue);
+
+		process_t * proc = process_queue->head->value;
+
+		debug_print(ERROR, "PID associated with this node is %d", proc->id);
+	}
 	node_t * np = list_dequeue(process_queue);
 	assert(np && "Ready queue is empty.");
 	process_t * next = np->value;
@@ -143,6 +163,11 @@ void make_process_ready(process_t * proc) {
 			spin_unlock(wait_lock_tmp);
 		}
 	}
+	if (proc->sched_node.owner) {
+		debug_print(WARNING, "Can't make process ready without removing from owner list: %d", proc->id);
+		debug_print(WARNING, "  (This is a bug) Current owner list is 0x%x (ready queue is 0x%x)", proc->sched_node.owner, process_queue);
+		return;
+	}
 	spin_lock(process_queue_lock);
 	list_append(process_queue, &proc->sched_node);
 	spin_unlock(process_queue_lock);
@@ -173,9 +198,15 @@ void delete_process(process_t * proc) {
 	/* Remove the entry. */
 	spin_lock(tree_lock);
 	/* Reparent everyone below me to init */
+	int has_children = entry->children->length;
 	tree_remove_reparent_root(process_tree, entry);
 	list_delete(process_list, list_find(process_list, proc));
 	spin_unlock(tree_lock);
+
+	if (has_children) {
+		process_t * init = process_tree->root->value;
+		wakeup_queue(init->wait_queue);
+	}
 
 	bitset_clear(&pid_set, proc->id);
 
@@ -211,6 +242,8 @@ process_t * spawn_kidle(void) {
 	idle->shm_mappings = list_create();
 	idle->signal_queue = list_create();
 
+	gettimeofday(&idle->start, NULL);
+
 	set_process_environment(idle, current_directory);
 	return idle;
 }
@@ -232,18 +265,22 @@ process_t * spawn_init(void) {
 	 * of the process' entry in the process tree. */
 	init->tree_entry = process_tree->root;
 	init->id      = 1;       /* Init is PID 1 */
-	init->group   = 0;
+	init->group   = 0; /* thread group id (real PID) */
+	init->job     = 1; /* process group id (jobs) */
+	init->session = 1; /* session leader id */
 	init->name    = strdup("init");  /* Um, duh. */
 	init->cmdline = NULL;
 	init->user    = 0;       /* UID 0 */
+	init->real_user = 0;
 	init->mask    = 022;     /* umask */
-	init->group   = 0;       /* Task group 0 */
 	init->status  = 0;       /* Run status */
 	init->fds = malloc(sizeof(fd_table_t));
 	init->fds->refs = 1;
 	init->fds->length   = 0;  /* Initialize the file descriptors */
 	init->fds->capacity = 4;
 	init->fds->entries  = malloc(sizeof(fs_node_t *) * init->fds->capacity);
+	init->fds->modes    = malloc(sizeof(int) * init->fds->capacity);
+	init->fds->offsets  = malloc(sizeof(uint64_t) * init->fds->capacity);
 
 	/* Set the working directory */
 	init->wd_node = clone_fs(fs_root);
@@ -262,6 +299,7 @@ process_t * spawn_init(void) {
 
 	/* Process is not finished */
 	init->finished = 0;
+	init->suspended = 0;
 	init->started = 1;
 	init->running = 1;
 	init->wait_queue = list_create();
@@ -342,7 +380,8 @@ process_t * spawn_process(volatile process_t * parent, int reuse_fds) {
 
 	/* Allocate a new process */
 	debug_print(INFO,"   process_t {");
-	process_t * proc = calloc(sizeof(process_t),1);
+	process_t * proc = malloc(sizeof(process_t));
+	memset(proc, 0, sizeof(process_t));
 	debug_print(INFO,"   }");
 	proc->id = get_next_pid(); /* Set its PID */
 	proc->group = proc->id;    /* Set the GID */
@@ -352,10 +391,12 @@ process_t * spawn_process(volatile process_t * parent, int reuse_fds) {
 
 	/* Copy permissions */
 	proc->user  = parent->user;
+	proc->real_user = parent->real_user;
 	proc->mask = parent->mask;
 
-	/* XXX this is wrong? */
-	proc->group = parent->group;
+	/* Until specified otherwise */
+	proc->job = parent->job;
+	proc->session = parent->session;
 
 	/* Zero out the ESP/EBP/EIP */
 	proc->thread.esp = 0;
@@ -390,10 +431,14 @@ process_t * spawn_process(volatile process_t * parent, int reuse_fds) {
 		proc->fds->capacity = parent->fds->capacity;
 		debug_print(INFO,"    fds / files {");
 		proc->fds->entries  = malloc(sizeof(fs_node_t *) * proc->fds->capacity);
+		proc->fds->modes    = malloc(sizeof(int) * proc->fds->capacity);
+		proc->fds->offsets  = malloc(sizeof(uint64_t) * proc->fds->capacity);
 		assert(proc->fds->entries && "Failed to allocate file descriptor table for new process.");
 		debug_print(INFO,"    ---");
 		for (uint32_t i = 0; i < parent->fds->length; ++i) {
 			proc->fds->entries[i] = clone_fs(parent->fds->entries[i]);
+			proc->fds->modes[i]   = parent->fds->modes[i];
+			proc->fds->offsets[i] = parent->fds->offsets[i];
 		}
 		debug_print(INFO,"    }");
 	}
@@ -405,6 +450,7 @@ process_t * spawn_process(volatile process_t * parent, int reuse_fds) {
 	/* Zero out the process status */
 	proc->status = 0;
 	proc->finished = 0;
+	proc->suspended = 0;
 	proc->started = 0;
 	proc->running = 0;
 	memset(proc->signals.functions, 0x00, sizeof(uintptr_t) * NUMSIGNALS);
@@ -424,6 +470,8 @@ process_t * spawn_process(volatile process_t * parent, int reuse_fds) {
 	proc->timed_sleep_node = NULL;
 
 	proc->is_tasklet = 0;
+
+	gettimeofday(&proc->start, NULL);
 
 	/* Insert the process into the process tree as a child
 	 * of the parent process. */
@@ -542,6 +590,9 @@ uint32_t process_append_fd(process_t * proc, fs_node_t * node) {
 	for (unsigned int i = 0; i < proc->fds->length; ++i) {
 		if (!proc->fds->entries[i]) {
 			proc->fds->entries[i] = node;
+			/* modes, offsets must be set by caller */
+			proc->fds->modes[i] = 0;
+			proc->fds->offsets[i] = 0;
 			return i;
 		}
 	}
@@ -549,8 +600,13 @@ uint32_t process_append_fd(process_t * proc, fs_node_t * node) {
 	if (proc->fds->length == proc->fds->capacity) {
 		proc->fds->capacity *= 2;
 		proc->fds->entries = realloc(proc->fds->entries, sizeof(fs_node_t *) * proc->fds->capacity);
+		proc->fds->modes   = realloc(proc->fds->modes,   sizeof(int) * proc->fds->capacity);
+		proc->fds->offsets = realloc(proc->fds->offsets, sizeof(uint64_t) * proc->fds->capacity);
 	}
 	proc->fds->entries[proc->fds->length] = node;
+	/* modes, offsets must be set by caller */
+	proc->fds->modes[proc->fds->length] = 0;
+	proc->fds->offsets[proc->fds->length] = 0;
 	proc->fds->length++;
 	return proc->fds->length-1;
 }
@@ -565,7 +621,7 @@ uint32_t process_append_fd(process_t * proc, fs_node_t * node) {
  * @return The destination file descriptor, -1 on failure
  */
 uint32_t process_move_fd(process_t * proc, int src, int dest) {
-	if ((size_t)src > proc->fds->length || (dest != -1 && (size_t)dest > proc->fds->length)) {
+	if ((size_t)src >= proc->fds->length || (dest != -1 && (size_t)dest >= proc->fds->length)) {
 		return -1;
 	}
 	if (dest == -1) {
@@ -574,6 +630,8 @@ uint32_t process_move_fd(process_t * proc, int src, int dest) {
 	if (proc->fds->entries[dest] != proc->fds->entries[src]) {
 		close_fs(proc->fds->entries[dest]);
 		proc->fds->entries[dest] = proc->fds->entries[src];
+		proc->fds->modes[dest] = proc->fds->modes[src];
+		proc->fds->offsets[dest] = proc->fds->offsets[src];
 		open_fs(proc->fds->entries[dest], 0);
 	}
 	return dest;
@@ -635,11 +693,17 @@ void wakeup_sleepers(unsigned long seconds, unsigned long subseconds) {
 	if (sleep_queue->length) {
 		sleeper_t * proc = ((sleeper_t *)sleep_queue->head->value);
 		while (proc && (proc->end_tick < seconds || (proc->end_tick == seconds && proc->end_subtick <= subseconds))) {
-			process_t * process = proc->process;
-			process->sleep_node.owner = NULL;
-			process->timed_sleep_node = NULL;
-			if (!process_is_ready(process)) {
-				make_process_ready(process);
+
+			if (proc->is_fswait) {
+				proc->is_fswait = -1;
+				process_alert_node(proc->process,proc);
+			} else {
+				process_t * process = proc->process;
+				process->sleep_node.owner = NULL;
+				process->timed_sleep_node = NULL;
+				if (!process_is_ready(process)) {
+					make_process_ready(process);
+				}
 			}
 			free(proc);
 			free(list_dequeue(sleep_queue));
@@ -675,6 +739,7 @@ void sleep_until(process_t * process, unsigned long seconds, unsigned long subse
 	proc->process     = process;
 	proc->end_tick    = seconds;
 	proc->end_subtick = subseconds;
+	proc->is_fswait = 0;
 	process->timed_sleep_node = list_insert_after(sleep_queue, before, proc);
 	spin_unlock(sleep_lock);
 	IRQ_RES;
@@ -689,6 +754,13 @@ void cleanup_process(process_t * proc, int retval) {
 	list_free(proc->signal_queue);
 	free(proc->signal_queue);
 	free(proc->wd_name);
+
+
+	if (proc->node_waits) {
+		list_free(proc->node_waits);
+		free(proc->node_waits);
+		proc->node_waits = NULL;
+	}
 	debug_print(INFO, "Releasing shared memory for %d", proc->id);
 	shm_release_all(proc);
 	free(proc->shm_mappings);
@@ -712,6 +784,8 @@ void cleanup_process(process_t * proc, int retval) {
 		}
 		debug_print(INFO, "... and their storage %d", proc->id);
 		free(proc->fds->entries);
+		free(proc->fds->offsets);
+		free(proc->fds->modes);
 		free(proc->fds);
 		debug_print(INFO, "... and the kernel stack (hope this ain't us) %d", proc->id);
 		free((void *)(proc->image.stack - KERNEL_STACK_SIZE));
@@ -728,15 +802,18 @@ void reap_process(process_t * proc) {
 }
 
 static int wait_candidate(process_t * parent, int pid, int options, process_t * proc) {
-	(void)options; /* there is only one option that affects candidacy, and we don't support it yet */
-
 	if (!proc) return 0;
 
+	if (options & WNOKERN) {
+		/* Skip kernel processes */
+		if (proc->is_tasklet) return 0;
+	}
+
 	if (pid < -1) {
-		if (proc->group == -pid || proc->id == -pid) return 1;
+		if (proc->job == -pid || proc->id == -pid) return 1;
 	} else if (pid == 0) {
 		/* Matches our group ID */
-		if (proc->group == parent->id) return 1;
+		if (proc->job == parent->id) return 1;
 	} else if (pid > 0) {
 		/* Specific pid */
 		if (proc->id == pid) return 1;
@@ -771,6 +848,10 @@ int waitpid(int pid, int * status, int options) {
 					candidate = child;
 					break;
 				}
+				if ((options & WSTOPPED) && child->suspended) {
+					candidate = child;
+					break;
+				}
 			}
 		}
 
@@ -786,10 +867,12 @@ int waitpid(int pid, int * status, int options) {
 				*status = candidate->status;
 			}
 			int pid = candidate->id;
-			reap_process(candidate);
+			if (candidate->finished) {
+				reap_process(candidate);
+			}
 			return pid;
 		} else {
-			if (options & 1) {
+			if (options & WNOHANG) {
 				return 0;
 			}
 			debug_print(INFO, "Sleeping until queue is done.");
@@ -800,5 +883,118 @@ int waitpid(int pid, int * status, int options) {
 			}
 		}
 	} while (1);
+}
+
+int process_wait_nodes(process_t * process,fs_node_t * nodes[], int timeout) {
+	assert(!process->node_waits && "Tried to wait on nodes while already waiting on nodes.");
+
+	fs_node_t ** n = nodes;
+	int index = 0;
+	if (*n) {
+		do {
+			int result = selectcheck_fs(*n);
+			if (result < 0) {
+				debug_print(NOTICE, "An invalid descriptor was specified: %d (0x%x) (pid=%d)", index, *n, current_process->id);
+				return -1;
+			}
+			if (result == 0) {
+				return index;
+			}
+			n++;
+			index++;
+		} while (*n);
+	}
+
+	if (timeout == 0) {
+		return -2;
+	}
+
+	n = nodes;
+
+	process->node_waits = list_create();
+	if (*n) {
+		do {
+			if (selectwait_fs(*n, process) < 0) {
+				debug_print(NOTICE, "Bad selectwait? 0x%x", *n);
+			}
+			n++;
+		} while (*n);
+	}
+
+	if (timeout > 0) {
+		debug_print(INFO, "fswait with a timeout of %d (pid=%d)", timeout, current_process->id);
+		unsigned long s, ss;
+		relative_time(0, timeout, &s, &ss);
+
+		IRQ_OFF;
+		spin_lock(sleep_lock);
+		node_t * before = NULL;
+		foreach(node, sleep_queue) {
+			sleeper_t * candidate = ((sleeper_t *)node->value);
+			if (candidate->end_tick > s || (candidate->end_tick == s && candidate->end_subtick > ss)) {
+				break;
+			}
+			before = node;
+		}
+		sleeper_t * proc = malloc(sizeof(sleeper_t));
+		proc->process     = process;
+		proc->end_tick    = s;
+		proc->end_subtick = ss;
+		proc->is_fswait = 1;
+		list_insert(((process_t *)process)->node_waits, proc);
+		process->timeout_node = list_insert_after(sleep_queue, before, proc);
+		spin_unlock(sleep_lock);
+		IRQ_RES;
+	} else {
+		process->timeout_node = NULL;
+	}
+
+	process->awoken_index = -1;
+	/* Wait. */
+	switch_task(0);
+
+	return process->awoken_index;
+}
+
+int process_awaken_from_fswait(process_t * process, int index) {
+	process->awoken_index = index;
+	list_free(process->node_waits);
+	free(process->node_waits);
+	process->node_waits = NULL;
+	if (process->timeout_node && process->timeout_node->owner == sleep_queue) {
+		sleeper_t * proc = process->timeout_node->value;
+		if (proc->is_fswait != -1) {
+			list_delete(sleep_queue, process->timeout_node);
+			free(process->timeout_node->value);
+			free(process->timeout_node);
+		}
+	}
+	process->timeout_node = NULL;
+	make_process_ready(process);
+	return 0;
+}
+
+int process_alert_node(process_t * process, void * value) {
+
+	if (!is_valid_process(process)) {
+		debug_print(WARNING, "Invalid process in alert from fswait.");
+		return 0;
+	}
+
+
+
+	if (!process->node_waits) {
+		return 0; /* Possibly already returned. Wait for another call. */
+	}
+
+	int index = 0;
+	foreach(node, process->node_waits) {
+		if (value == node->value) {
+			return process_awaken_from_fswait(process, index);
+		}
+		index++;
+	}
+
+	return -1;
 }
 

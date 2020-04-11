@@ -1,14 +1,15 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2014 Kevin Lange
+ * Copyright (C) 2014-2018 K. Lange
  */
-#include <system.h>
-#include <fs.h>
-#include <pipe.h>
-#include <module.h>
-#include <logging.h>
-#include <ioctl.h>
+#include <kernel/system.h>
+#include <kernel/fs.h>
+#include <kernel/pipe.h>
+#include <kernel/module.h>
+#include <kernel/logging.h>
+
+#include <sys/ioctl.h>
 
 #define MAX_PACKET_SIZE 1024
 
@@ -97,7 +98,7 @@ static pex_client_t * create_client(pex_ex_t * p) {
 	return out;
 }
 
-static uint32_t read_server(fs_node_t * node, uint32_t offset, uint32_t size, uint8_t * buffer) {
+static uint32_t read_server(fs_node_t * node, uint64_t offset, uint32_t size, uint8_t * buffer) {
 	pex_ex_t * p = (pex_ex_t *)node->device;
 	debug_print(INFO, "[pex] server read(...)");
 
@@ -118,7 +119,7 @@ static uint32_t read_server(fs_node_t * node, uint32_t offset, uint32_t size, ui
 	return out;
 }
 
-static uint32_t write_server(fs_node_t * node, uint32_t offset, uint32_t size, uint8_t * buffer) {
+static uint32_t write_server(fs_node_t * node, uint64_t offset, uint32_t size, uint8_t * buffer) {
 	pex_ex_t * p = (pex_ex_t *)node->device;
 	debug_print(INFO, "[pex] server write(...)");
 
@@ -139,7 +140,7 @@ static uint32_t write_server(fs_node_t * node, uint32_t offset, uint32_t size, u
 		debug_print(INFO, "Done broadcasting to clients.");
 		return size;
 	} else if (head->target->parent != p) {
-		debug_print(WARNING, "[pex] Invalid packet from server?");
+		debug_print(WARNING, "[pex] Invalid packet from server? (pid=%d)", current_process->id);
 		return -1;
 	}
 
@@ -157,7 +158,7 @@ static int ioctl_server(fs_node_t * node, int request, void * argp) {
 	}
 }
 
-static uint32_t read_client(fs_node_t * node, uint32_t offset, uint32_t size, uint8_t * buffer) {
+static uint32_t read_client(fs_node_t * node, uint64_t offset, uint32_t size, uint8_t * buffer) {
 	pex_client_t * c = (pex_client_t *)node->inode;
 	if (c->parent != node->device) {
 		debug_print(WARNING, "[pex] Invalid device endpoint on client read?");
@@ -184,7 +185,7 @@ static uint32_t read_client(fs_node_t * node, uint32_t offset, uint32_t size, ui
 	return out;
 }
 
-static uint32_t write_client(fs_node_t * node, uint32_t offset, uint32_t size, uint8_t * buffer) {
+static uint32_t write_client(fs_node_t * node, uint64_t offset, uint32_t size, uint8_t * buffer) {
 	pex_client_t * c = (pex_client_t *)node->inode;
 	if (c->parent != node->device) {
 		debug_print(WARNING, "[pex] Invalid device endpoint on client write?");
@@ -238,6 +239,24 @@ static void close_client(fs_node_t * node) {
 	free(c);
 }
 
+static int wait_server(fs_node_t * node, void * process) {
+	pex_ex_t * p = (pex_ex_t *)node->device;
+	return selectwait_fs(p->server_pipe, process);
+}
+static int check_server(fs_node_t * node) {
+	pex_ex_t * p = (pex_ex_t *)node->device;
+	return selectcheck_fs(p->server_pipe);
+}
+
+static int wait_client(fs_node_t * node, void * process) {
+	pex_client_t * c = (pex_client_t *)node->inode;
+	return selectwait_fs(c->pipe, process);
+}
+static int check_client(fs_node_t * node) {
+	pex_client_t * c = (pex_client_t *)node->inode;
+	return selectcheck_fs(c->pipe);
+}
+
 static void open_pex(fs_node_t * node, unsigned int flags) {
 	pex_ex_t * t = (pex_ex_t *)(node->device);
 
@@ -250,6 +269,8 @@ static void open_pex(fs_node_t * node, unsigned int flags) {
 		node->read   = read_server;
 		node->write  = write_server;
 		node->ioctl  = ioctl_server;
+		node->selectcheck = check_server;
+		node->selectwait  = wait_server;
 		debug_print(INFO, "[pex] Server launched: %s", t->name);
 		debug_print(INFO, "fs_node = 0x%x", node);
 	} else if (!(flags & O_CREAT)) {
@@ -261,6 +282,9 @@ static void open_pex(fs_node_t * node, unsigned int flags) {
 		node->ioctl = ioctl_client;
 		node->close = close_client;
 
+		node->selectcheck = check_client;
+		node->selectwait  = wait_client;
+
 		list_insert(t->clients, client);
 
 		/* XXX: Send plumbing message to server for new client connection */
@@ -271,7 +295,6 @@ static void open_pex(fs_node_t * node, unsigned int flags) {
 
 	return;
 }
-
 
 static struct dirent * readdir_packetfs(fs_node_t *node, uint32_t index) {
 	pex_t * p = (pex_t *)node->device;
@@ -328,6 +351,7 @@ static fs_node_t * file_from_pex(pex_ex_t * pex) {
 	fnode->inode = 0;
 	strcpy(fnode->name, pex->name);
 	fnode->device  = pex;
+	fnode->mask    = 0666;
 	fnode->flags   = FS_CHARDEVICE;
 	fnode->open    = open_pex;
 	fnode->read    = read_server;
@@ -356,8 +380,8 @@ static fs_node_t * finddir_packetfs(fs_node_t * node, char * name) {
 	return NULL;
 }
 
-static void create_packetfs(fs_node_t *parent, char *name, uint16_t permission) {
-	if (!name) return;
+static int create_packetfs(fs_node_t *parent, char *name, uint16_t permission) {
+	if (!name) return -EINVAL;
 
 	pex_t * p = (pex_t *)parent->device;
 
@@ -370,7 +394,7 @@ static void create_packetfs(fs_node_t *parent, char *name, uint16_t permission) 
 		if (!strcmp(name, t->name)) {
 			spin_unlock(p->lock);
 			/* Already exists */
-			return;
+			return -EEXIST;
 		}
 	}
 
@@ -389,14 +413,15 @@ static void create_packetfs(fs_node_t *parent, char *name, uint16_t permission) 
 
 	spin_unlock(p->lock);
 
+	return 0;
 }
 
 static void destroy_pex(pex_ex_t * p) {
 	/* XXX */
 }
 
-static void unlink_packetfs(fs_node_t *parent, char *name) {
-	if (!name) return;
+static int unlink_packetfs(fs_node_t *parent, char *name) {
+	if (!name) return -EINVAL;
 
 	pex_t * p = (pex_t *)parent->device;
 
@@ -418,9 +443,14 @@ static void unlink_packetfs(fs_node_t *parent, char *name) {
 
 	if (i >= 0) {
 		list_remove(p->exchanges, i);
+	} else {
+		spin_unlock(p->lock);
+		return -ENOENT;
 	}
 
 	spin_unlock(p->lock);
+
+	return 0;
 }
 
 static fs_node_t * packetfs_manager(void) {
@@ -434,6 +464,7 @@ static fs_node_t * packetfs_manager(void) {
 	fnode->inode = 0;
 	strcpy(fnode->name, "pex");
 	fnode->device  = pex;
+	fnode->mask    = 0777;
 	fnode->flags   = FS_DIRECTORY;
 	fnode->readdir = readdir_packetfs;
 	fnode->finddir = finddir_packetfs;

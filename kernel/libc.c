@@ -7,8 +7,11 @@
  *
  */
 
-#include <system.h>
-#include <limits.h>
+#include <kernel/system.h>
+
+#ifndef UCHAR_MAX
+#define UCHAR_MAX 255
+#endif
 
 #define ALIGN (sizeof(size_t))
 #define ONES ((size_t)-1/UCHAR_MAX)
@@ -19,7 +22,7 @@
  ((A)[(size_t)(B)/(8*sizeof *(A))] OP (size_t)1<<((size_t)(B)%(8*sizeof *(A))))
 
 void * memcpy(void * restrict dest, const void * restrict src, size_t n) {
-	asm volatile("rep movsb"
+	asm volatile("cld; rep movsb"
 	            : "=c"((int){0})
 	            : "D"(dest), "S"(src), "c"(n)
 	            : "flags", "memory");
@@ -27,7 +30,7 @@ void * memcpy(void * restrict dest, const void * restrict src, size_t n) {
 }
 
 void * memset(void * dest, int c, size_t n) {
-	asm volatile("rep stosb"
+	asm volatile("cld; rep stosb"
 	             : "=c"((int){0})
 	             : "D"(dest), "a"(c), "c"(n)
 	             : "flags", "memory");

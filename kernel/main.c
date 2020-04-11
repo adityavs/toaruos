@@ -3,7 +3,7 @@
  * The ToAruOS kernel is released under the terms of the
  * University of Illinois / NCSA License.
  *
- * Copyright (C) 2011-2014 Kevin Lange.  All rights reserved.
+ * Copyright (C) 2011-2018 K. Lange.  All rights reserved.
  * Copyright (C) 2012 Markus Schober
  * Copyright (C) 2014 Lioncash
  *
@@ -12,7 +12,7 @@
  *                                   1941-2011
  *
  * Developed by: ToAruOS Kernel Development Team
- *               http://github.com/klange/osdev
+ *               http://github.com/klange/toaruos
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -25,7 +25,7 @@
  *   2. Redistributions in binary form must reproduce the above copyright
  *      notice, this list of conditions and the following disclaimers in the
  *      documentation and/or other materials provided with the distribution.
- *   3. Neither the names of the ToAruOS Kernel Development Team, Kevin Lange,
+ *   3. Neither the names of the ToAruOS Kernel Development Team, K. Lange,
  *      nor the names of its contributors may be used to endorse
  *      or promote products derived from this Software without specific prior
  *      written permission.
@@ -39,15 +39,16 @@
  * WITH THE SOFTWARE.
  */
 
-#include <system.h>
-#include <boot.h>
-#include <ext2.h>
-#include <fs.h>
-#include <logging.h>
-#include <process.h>
-#include <shm.h>
-#include <args.h>
-#include <module.h>
+#include <kernel/system.h>
+#include <kernel/boot.h>
+#include <kernel/ext2.h>
+#include <kernel/fs.h>
+#include <kernel/logging.h>
+#include <kernel/process.h>
+#include <kernel/shm.h>
+#include <kernel/args.h>
+#include <kernel/module.h>
+#include <kernel/pci.h>
 
 uintptr_t initial_esp = 0;
 
@@ -55,7 +56,7 @@ fs_node_t * ramdisk_mount(uintptr_t, size_t);
 
 #ifdef EARLY_BOOT_LOG
 #define EARLY_LOG_DEVICE 0x3F8
-static uint32_t _early_log_write(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+static uint32_t _early_log_write(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer) {
 	for (unsigned int i = 0; i < size; ++i) {
 		outportb(EARLY_LOG_DEVICE, buffer[i]);
 	}
@@ -93,14 +94,12 @@ int kmain(struct multiboot *mboot, uint32_t mboot_mag, uintptr_t esp) {
 	/* Initialize core modules */
 	gdt_install();      /* Global descriptor table */
 	idt_install();      /* IDT */
-	isrs_install();     /* Interrupt service requests */
-	irq_install();      /* Hardware interrupt requests */
 
-	if (mboot_ptr->flags & (1 << 3)) {
+	uintptr_t last_mod = (uintptr_t)&end;
+	if (mboot_ptr->flags & MULTIBOOT_FLAG_MODS) {
 		debug_print(NOTICE, "There %s %d module%s starting at 0x%x.", mboot_ptr->mods_count == 1 ? "is" : "are", mboot_ptr->mods_count, mboot_ptr->mods_count == 1 ? "" : "s", mboot_ptr->mods_addr);
 		debug_print(NOTICE, "Current kernel heap start point would be 0x%x.", &end);
 		if (mboot_ptr->mods_count > 0) {
-			uintptr_t last_mod = (uintptr_t)&end;
 			uint32_t i;
 			mboot_mods = (mboot_mod_t *)mboot_ptr->mods_addr;
 			mboot_mods_count = mboot_ptr->mods_count;
@@ -111,6 +110,7 @@ int kmain(struct multiboot *mboot, uint32_t mboot_mag, uintptr_t esp) {
 				if ((uintptr_t)mod + sizeof(mboot_mod_t) > last_mod) {
 					/* Just in case some silly person put this *behind* the modules... */
 					last_mod = (uintptr_t)mod + sizeof(mboot_mod_t);
+					debug_print(NOTICE, "moving forward to 0x%x", last_mod);
 				}
 				debug_print(NOTICE, "Module %d is at 0x%x:0x%x", i, module_start, module_end);
 				if (last_mod < module_end) {
@@ -118,12 +118,21 @@ int kmain(struct multiboot *mboot, uint32_t mboot_mag, uintptr_t esp) {
 				}
 			}
 			debug_print(NOTICE, "Moving kernel heap start to 0x%x", last_mod);
-			kmalloc_startat(last_mod);
 		}
 	}
+	if ((uintptr_t)mboot_ptr > last_mod) {
+		last_mod = (uintptr_t)mboot_ptr + sizeof(struct multiboot);
+	}
+	while (last_mod & 0x7FF) last_mod++;
+	kmalloc_startat(last_mod);
 
-	paging_install(mboot_ptr->mem_upper + mboot_ptr->mem_lower);
-	if (mboot_ptr->flags & (1 << 6)) {
+	if (mboot_ptr->flags & MULTIBOOT_FLAG_MEM) {
+		paging_install(mboot_ptr->mem_upper + mboot_ptr->mem_lower);
+	} else {
+		debug_print(CRITICAL, "Missing MEM flag in multiboot header\n");
+	}
+
+	if (mboot_ptr->flags & MULTIBOOT_FLAG_MMAP) {
 		debug_print(NOTICE, "Parsing memory map.");
 		mboot_memmap_t * mmap = (void *)mboot_ptr->mmap_addr;
 		while ((uintptr_t)mmap < mboot_ptr->mmap_addr + mboot_ptr->mmap_length) {
@@ -157,6 +166,9 @@ int kmain(struct multiboot *mboot, uint32_t mboot_mag, uintptr_t esp) {
 		args_parse(cmdline);
 	}
 
+	isrs_install();     /* Interrupt service requests */
+	irq_install();      /* Hardware interrupt requests */
+
 	vfs_install();
 	tasking_install();  /* Multi-tasking */
 	timer_install();    /* PIC driver */
@@ -164,44 +176,47 @@ int kmain(struct multiboot *mboot, uint32_t mboot_mag, uintptr_t esp) {
 	syscalls_install(); /* Install the system calls */
 	shm_install();      /* Install shared memory */
 	modules_install();  /* Modules! */
+	pci_remap();
 
 	DISABLE_EARLY_BOOT_LOG();
 
 	/* Load modules from bootloader */
-	debug_print(NOTICE, "%d modules to load", mboot_mods_count);
-	for (unsigned int i = 0; i < mboot_ptr->mods_count; ++i ) {
-		mboot_mod_t * mod = &mboot_mods[i];
-		uint32_t module_start = mod->mod_start;
-		uint32_t module_end = mod->mod_end;
-		size_t   module_size = module_end - module_start;
+	if (mboot_ptr->flags & MULTIBOOT_FLAG_MODS) {
+		debug_print(NOTICE, "%d modules to load", mboot_mods_count);
+		for (unsigned int i = 0; i < mboot_ptr->mods_count; ++i ) {
+			mboot_mod_t * mod = &mboot_mods[i];
+			uint32_t module_start = mod->mod_start;
+			uint32_t module_end = mod->mod_end;
+			size_t   module_size = module_end - module_start;
 
-		int check_result = module_quickcheck((void *)module_start);
-		if (check_result == 1) {
-			debug_print(NOTICE, "Loading a module: 0x%x:0x%x", module_start, module_end);
-			module_data_t * mod_info = (module_data_t *)module_load_direct((void *)(module_start), module_size);
-			if (mod_info) {
-				debug_print(NOTICE, "Loaded: %s", mod_info->mod_info->name);
-			}
-		} else if (check_result == 2) {
-			/* Mod pack */
-			debug_print(NOTICE, "Loading modpack. %x", module_start);
-			struct pack_header * pack_header = (struct pack_header *)module_start;
-			while (pack_header->region_size) {
-				void * start = (void *)((uintptr_t)pack_header + 4096);
-				int result = module_quickcheck(start);
-				if (result != 1) {
-					debug_print(WARNING, "Not actually a module?! %x", start);
-				}
-				module_data_t * mod_info = (module_data_t *)module_load_direct(start, pack_header->region_size);
+			int check_result = module_quickcheck((void *)module_start);
+			if (check_result == 1) {
+				debug_print(NOTICE, "Loading a module: 0x%x:0x%x", module_start, module_end);
+				module_data_t * mod_info = (module_data_t *)module_load_direct((void *)(module_start), module_size);
 				if (mod_info) {
 					debug_print(NOTICE, "Loaded: %s", mod_info->mod_info->name);
 				}
-				pack_header = (struct pack_header *)((uintptr_t)start + pack_header->region_size);
+			} else if (check_result == 2) {
+				/* Mod pack */
+				debug_print(NOTICE, "Loading modpack. %x", module_start);
+				struct pack_header * pack_header = (struct pack_header *)module_start;
+				while (pack_header->region_size) {
+					void * start = (void *)((uintptr_t)pack_header + 4096);
+					int result = module_quickcheck(start);
+					if (result != 1) {
+						debug_print(WARNING, "Not actually a module?! %x", start);
+					}
+					module_data_t * mod_info = (module_data_t *)module_load_direct(start, pack_header->region_size);
+					if (mod_info) {
+						debug_print(NOTICE, "Loaded: %s", mod_info->mod_info->name);
+					}
+					pack_header = (struct pack_header *)((uintptr_t)start + pack_header->region_size);
+				}
+				debug_print(NOTICE, "Done with modpack.");
+			} else {
+				debug_print(NOTICE, "Loading ramdisk: 0x%x:0x%x", module_start, module_end);
+				ramdisk_mount(module_start, module_size);
 			}
-			debug_print(NOTICE, "Done with modpack.");
-		} else {
-			debug_print(NOTICE, "Loading ramdisk: 0x%x:0x%x", module_start, module_end);
-			ramdisk_mount(module_start, module_size);
 		}
 	}
 
@@ -209,28 +224,35 @@ int kmain(struct multiboot *mboot, uint32_t mboot_mag, uintptr_t esp) {
 	map_vfs_directory("/dev");
 
 	if (args_present("root")) {
-		vfs_mount_type("ext2", args_value("root"), "/");
+		char * root_type = "ext2";
+		if (args_present("root_type")) {
+			root_type = args_value("root_type");
+		}
+		vfs_mount_type(root_type, args_value("root"), "/");
 	}
 
-	if (args_present("start")) {
-		char * c = args_value("start");
+	if (args_present("args")) {
+		char * c = args_value("args");
 		if (!c) {
-			debug_print(WARNING, "Expected an argument to kernel option `start`. Ignoring.");
+			debug_print(WARNING, "Expected an argument to kernel option `args`. Ignoring.");
 		} else {
-			debug_print(NOTICE, "Got start argument: %s", c);
+			debug_print(NOTICE, "Got init argument: %s", c);
 			boot_arg = strdup(c);
 		}
 	}
 
 	if (!fs_root) {
-		debug_print(CRITICAL, "No root filesystem is mounted. Skipping init.");
 		map_vfs_directory("/");
-		switch_task(0);
+	}
+
+	char * boot_app = "/bin/init";
+	if (args_present("init")) {
+		boot_app = args_value("init");
 	}
 
 	/* Prepare to run /bin/init */
 	char * argv[] = {
-		"/bin/init",
+		boot_app,
 		boot_arg,
 		NULL
 	};
@@ -238,7 +260,10 @@ int kmain(struct multiboot *mboot, uint32_t mboot_mag, uintptr_t esp) {
 	while (argv[argc]) {
 		argc++;
 	}
-	system(argv[0], argc, argv); /* Run init */
+	system(argv[0], argc, argv, NULL); /* Run init */
+
+	debug_print(CRITICAL, "init failed");
+	switch_task(0);
 
 	return 0;
 }

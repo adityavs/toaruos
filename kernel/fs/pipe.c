@@ -1,24 +1,19 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2012-2014 Kevin Lange
+ * Copyright (C) 2012-2018 K. Lange
  *
  * Buffered Pipe
  *
  */
 
-#include <system.h>
-#include <fs.h>
-#include <printf.h>
-#include <pipe.h>
-#include <logging.h>
+#include <kernel/system.h>
+#include <kernel/fs.h>
+#include <kernel/printf.h>
+#include <kernel/pipe.h>
+#include <kernel/logging.h>
 
 #define DEBUG_PIPES 0
-
-uint32_t read_pipe(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer);
-uint32_t write_pipe(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer);
-void open_pipe(fs_node_t *node, unsigned int flags);
-void close_pipe(fs_node_t *node);
 
 static inline size_t pipe_unread(pipe_device_t * pipe) {
 	if (pipe->read_ptr == pipe->write_ptr) {
@@ -71,7 +66,18 @@ static inline void pipe_increment_write_by(pipe_device_t * pipe, size_t amount) 
 	pipe->write_ptr = (pipe->write_ptr + amount) % pipe->size;
 }
 
-uint32_t read_pipe(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+static void pipe_alert_waiters(pipe_device_t * pipe) {
+	if (pipe->alert_waiters) {
+		while (pipe->alert_waiters->head) {
+			node_t * node = list_dequeue(pipe->alert_waiters);
+			process_t * p = node->value;
+			process_alert_node(p, pipe);
+			free(node);
+		}
+	}
+}
+
+uint32_t read_pipe(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer) {
 	assert(node->device != 0 && "Attempted to read from a fully-closed pipe.");
 
 	/* Retreive the pipe object associated with this file node */
@@ -91,7 +97,7 @@ uint32_t read_pipe(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buf
 
 	if (pipe->dead) {
 		debug_print(WARNING, "Pipe is dead?");
-		send_signal(getpid(), SIGPIPE);
+		send_signal(getpid(), SIGPIPE, 1);
 		return 0;
 	}
 
@@ -114,7 +120,7 @@ uint32_t read_pipe(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buf
 	return collected;
 }
 
-uint32_t write_pipe(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+uint32_t write_pipe(fs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer) {
 	assert(node->device != 0 && "Attempted to write to a fully-closed pipe.");
 
 	/* Retreive the pipe object associated with this file node */
@@ -135,7 +141,7 @@ uint32_t write_pipe(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *bu
 
 	if (pipe->dead) {
 		debug_print(WARNING, "Pipe is dead?");
-		send_signal(getpid(), SIGPIPE);
+		send_signal(getpid(), SIGPIPE, 1);
 		return 0;
 	}
 
@@ -166,6 +172,7 @@ uint32_t write_pipe(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *bu
 
 		spin_unlock(pipe->lock_write);
 		wakeup_queue(pipe->wait_queue_readers);
+		pipe_alert_waiters(pipe);
 		if (written < size) {
 			sleep_on(pipe->wait_queue_writers);
 		}
@@ -211,16 +218,43 @@ void close_pipe(fs_node_t * node) {
 	return;
 }
 
+static int pipe_check(fs_node_t * node) {
+	pipe_device_t * pipe = (pipe_device_t *)node->device;
+
+	if (pipe_unread(pipe) > 0) {
+		return 0;
+	}
+
+	return 1;
+}
+
+static int pipe_wait(fs_node_t * node, void * process) {
+	pipe_device_t * pipe = (pipe_device_t *)node->device;
+
+	if (!pipe->alert_waiters) {
+		pipe->alert_waiters = list_create();
+	}
+
+	if (!list_find(pipe->alert_waiters, process)) {
+		list_insert(pipe->alert_waiters, process);
+	}
+	list_insert(((process_t *)process)->node_waits, pipe);
+
+	return 0;
+}
+
 fs_node_t * make_pipe(size_t size) {
 	fs_node_t * fnode = malloc(sizeof(fs_node_t));
 	pipe_device_t * pipe = malloc(sizeof(pipe_device_t));
 	memset(fnode, 0, sizeof(fs_node_t));
+	memset(pipe, 0, sizeof(pipe_device_t));
 
 	fnode->device = 0;
 	fnode->name[0] = '\0';
 	sprintf(fnode->name, "[pipe]");
 	fnode->uid   = 0;
 	fnode->gid   = 0;
+	fnode->mask  = 0666;
 	fnode->flags = FS_PIPE;
 	fnode->read  = read_pipe;
 	fnode->write = write_pipe;
@@ -230,6 +264,9 @@ fs_node_t * make_pipe(size_t size) {
 	fnode->finddir = NULL;
 	fnode->ioctl   = NULL; /* TODO ioctls for pipes? maybe */
 	fnode->get_size = pipe_size;
+
+	fnode->selectcheck = pipe_check;
+	fnode->selectwait  = pipe_wait;
 
 	fnode->atime = now();
 	fnode->mtime = fnode->atime;

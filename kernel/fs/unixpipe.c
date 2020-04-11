@@ -1,16 +1,16 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2014 Kevin Lange
+ * Copyright (C) 2014-2018 K. Lange
  */
-#include <system.h>
-#include <fs.h>
-#include <pipe.h>
-#include <logging.h>
-#include <printf.h>
+#include <kernel/system.h>
+#include <kernel/fs.h>
+#include <kernel/pipe.h>
+#include <kernel/logging.h>
+#include <kernel/printf.h>
+#include <kernel/ringbuffer.h>
 
-#include <ioctl.h>
-#include <ringbuffer.h>
+#include <sys/ioctl.h>
 
 #define UNIX_PIPE_BUFFER 512
 
@@ -28,7 +28,7 @@ static void close_complete(struct unix_pipe * self) {
 	ring_buffer_destroy(self->buffer);
 }
 
-static uint32_t read_unixpipe(fs_node_t * node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+static uint32_t read_unixpipe(fs_node_t * node, uint64_t offset, uint32_t size, uint8_t *buffer) {
 	struct unix_pipe * self = node->device;
 	size_t read = 0;
 
@@ -46,17 +46,14 @@ static uint32_t read_unixpipe(fs_node_t * node, uint32_t offset, uint32_t size, 
 	return read;
 }
 
-static uint32_t write_unixpipe(fs_node_t * node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+static uint32_t write_unixpipe(fs_node_t * node, uint64_t offset, uint32_t size, uint8_t *buffer) {
 	struct unix_pipe * self = node->device;
 	size_t written = 0;
 
 	while (written < size) {
 		if (self->read_closed) {
 			/* SIGPIPE to current process */
-			signal_t * sig = malloc(sizeof(signal_t));
-			sig->handler = current_process->signals.functions[SIGPIPE];
-			sig->signum  = SIGPIPE;
-			handle_signal((process_t *)current_process, sig);
+			send_signal(getpid(), SIGPIPE, 1);
 
 			return written;
 		}
@@ -90,8 +87,27 @@ static void close_write_pipe(fs_node_t * node) {
 		debug_print(NOTICE, "Both ends now closed, should clean up.");
 	} else {
 		ring_buffer_interrupt(self->buffer);
+		if (!ring_buffer_unread(self->buffer)) {
+			ring_buffer_alert_waiters(self->buffer);
+		}
 	}
 }
+
+static int check_pipe(fs_node_t * node) {
+	struct unix_pipe * self = node->device;
+	if (ring_buffer_unread(self->buffer) > 0) {
+		return 0;
+	}
+	if (self->write_closed) return 0;
+	return 1;
+}
+
+static int wait_pipe(fs_node_t * node, void * process) {
+	struct unix_pipe * self = node->device;
+	ring_buffer_select_wait(self->buffer, process);
+	return 0;
+}
+
 
 int make_unix_pipe(fs_node_t ** pipes) {
 	size_t size = UNIX_PIPE_BUFFER;
@@ -105,6 +121,9 @@ int make_unix_pipe(fs_node_t ** pipes) {
 	sprintf(pipes[0]->name, "[pipe:read]");
 	sprintf(pipes[1]->name, "[pipe:write]");
 
+	pipes[0]->mask = 0666;
+	pipes[1]->mask = 0666;
+
 	pipes[0]->flags = FS_PIPE;
 	pipes[1]->flags = FS_PIPE;
 
@@ -113,6 +132,10 @@ int make_unix_pipe(fs_node_t ** pipes) {
 
 	pipes[0]->close = close_read_pipe;
 	pipes[1]->close = close_write_pipe;
+
+	/* Read end can wait */
+	pipes[0]->selectcheck = check_pipe;
+	pipes[0]->selectwait = wait_pipe;
 
 	struct unix_pipe * internals = malloc(sizeof(struct unix_pipe));
 	internals->read_end = pipes[0];

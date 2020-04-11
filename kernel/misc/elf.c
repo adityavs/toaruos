@@ -1,17 +1,17 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2011-2014 Kevin Lange
+ * Copyright (C) 2011-2018 K. Lange
  *
  * ELF Static Executable Loader
  *
  */
 
-#include <system.h>
-#include <fs.h>
-#include <elf.h>
-#include <process.h>
-#include <logging.h>
+#include <kernel/system.h>
+#include <kernel/fs.h>
+#include <kernel/elf.h>
+#include <kernel/process.h>
+#include <kernel/logging.h>
 
 int exec_elf(char * path, fs_node_t * file, int argc, char ** argv, char ** env, int interp) {
 	Elf32_Header header;
@@ -27,11 +27,6 @@ int exec_elf(char * path, fs_node_t * file, int argc, char ** argv, char ** env,
 		return -1;
 	}
 
-	if (!interp) {
-		current_process->name = strdup(path);
-		current_process->cmdline = argv;
-	}
-
 	if (file->mask & 0x800) {
 		debug_print(WARNING, "setuid binary executed [%s, uid:%d]", file->name, file->uid);
 		current_process->user = file->uid;
@@ -45,10 +40,10 @@ int exec_elf(char * path, fs_node_t * file, int argc, char ** argv, char ** env,
 			close_fs(file);
 
 			/* Find interpreter? */
-			debug_print(WARNING, "Dynamic executable");
+			debug_print(INFO, "Dynamic executable");
 
 			unsigned int nargc = argc + 3;
-			char * args[nargc];
+			char * args[nargc+1];
 			args[0] = "ld.so";
 			args[1] = "-e";
 			args[2] = strdup(current_process->name);
@@ -93,6 +88,9 @@ int exec_elf(char * path, fs_node_t * file, int argc, char ** argv, char ** env,
 		Elf32_Phdr phdr;
 		read_fs(file, header.e_phoff + x, sizeof(Elf32_Phdr), (uint8_t *)&phdr);
 		if (phdr.p_type == PT_LOAD) {
+			/* TODO: These virtual address bounds should be in a header somewhere */
+			if (phdr.p_vaddr < 0x20000000) return -EINVAL;
+			/* TODO Upper bounds */
 			for (uintptr_t i = phdr.p_vaddr; i < phdr.p_vaddr + phdr.p_memsz; i += 0x1000) {
 				/* This doesn't care if we already allocated this page */
 				alloc_frame(get_page(i, 1, current_directory), 0, 1);
@@ -175,6 +173,14 @@ int exec_elf(char * path, fs_node_t * file, int argc, char ** argv, char ** env,
 
 	current_process->image.start = entry;
 
+	/* Close all fds >= 3 */
+	for (unsigned int i = 3; i < current_process->fds->length; ++i) {
+		if (current_process->fds->entries[i]) {
+			close_fs(current_process->fds->entries[i]);
+			current_process->fds->entries[i] = NULL;
+		}
+	}
+
 	/* Go go go */
 	enter_user_jmp(entry, argc, argv_, USER_STACK_TOP);
 
@@ -183,10 +189,14 @@ int exec_elf(char * path, fs_node_t * file, int argc, char ** argv, char ** env,
 }
 
 int exec_shebang(char * path, fs_node_t * file, int argc, char ** argv, char ** env, int interp) {
+	if (interp > 4) /* sounds good to me */ {
+		return -ELOOP;
+	}
 	/* Read MAX_LINE... */
 	char tmp[100];
 	read_fs(file, 0, 100, (unsigned char *)tmp); close_fs(file);
 	char * cmd = (char *)&tmp[2];
+	if (*cmd == ' ') cmd++; /* Handle a leading space */
 	char * space_or_linefeed = strpbrk(cmd, " \n");
 	char * arg = NULL;
 
@@ -212,7 +222,7 @@ int exec_shebang(char * path, fs_node_t * file, int argc, char ** argv, char ** 
 	memcpy(script, path, strlen(path)+1);
 
 	unsigned int nargc = argc + (arg ? 2 : 1);
-	char * args[nargc];
+	char * args[nargc + 2];
 	args[0] = cmd;
 	args[1] = arg ? arg : script;
 	args[2] = arg ? script : NULL;
@@ -224,7 +234,7 @@ int exec_shebang(char * path, fs_node_t * file, int argc, char ** argv, char ** 
 	}
 	args[j] = NULL;
 
-	return exec(cmd, nargc, args, env);
+	return exec(cmd, nargc, args, env, interp+1);
 }
 
 /* Consider exposing this and making it a list so it can be extended ... */
@@ -262,7 +272,8 @@ int exec(
 		char *  path, /* Path to the executable to run */
 		int     argc, /* Argument count (ie, /bin/echo hello world = 3) */
 		char ** argv, /* Argument strings (including executable path) */
-		char ** env   /* Environmen variables */
+		char ** env,  /* Environmen variables */
+		int interp_depth
 	) {
 	/* Open the file */
 	fs_node_t * file = kopen(path,0);
@@ -271,16 +282,23 @@ int exec(
 		return -ENOENT;
 	}
 
+	if (!has_permission(file, 01)) {
+		return -EACCES;
+	}
+
 	/* Read four bytes of the file */
 	unsigned char head[4];
 	read_fs(file, 0, 4, head);
 
-	debug_print(WARNING, "First four bytes: %c%c%c%c", head[0], head[1], head[2], head[3]);
+	debug_print(INFO, "First four bytes: %c%c%c%c", head[0], head[1], head[2], head[3]);
+
+	current_process->name = strdup(path);
+	gettimeofday((struct timeval *)&current_process->start, NULL);
 
 	for (unsigned int i = 0; i < sizeof(fmts) / sizeof(exec_def_t); ++i) {
 		if (matches(fmts[i].bytes, head, fmts[i].match)) {
-			debug_print(WARNING, "Matched executor: %s", fmts[i].name);
-			return fmts[i].func(path, file, argc, argv, env, 0);
+			debug_print(NOTICE, "Matched executor: %s", fmts[i].name);
+			return fmts[i].func(path, file, argc, argv, env, interp_depth);
 		}
 	}
 
@@ -293,7 +311,8 @@ int
 system(
 		char *  path, /* Path to the executable to run */
 		int     argc, /* Argument count (ie, /bin/echo hello world = 3) */
-		char ** argv  /* Argument strings (including executable path) */
+		char ** argv, /* Argument strings (including executable path) */
+		char ** envin
 	) {
 	char ** argv_ = malloc(sizeof(char *) * (argc + 1));
 	for (int j = 0; j < argc; ++j) {
@@ -305,7 +324,10 @@ system(
 	set_process_environment((process_t*)current_process, clone_directory(current_directory));
 	current_directory = current_process->thread.page_directory;
 	switch_page_directory(current_directory);
-	exec(path,argc,argv_,env);
+
+	current_process->cmdline = argv_;
+
+	exec(path,argc,argv_,envin ? envin : env, 0);
 	debug_print(ERROR, "Failed to execute process!");
 	kexit(-1);
 	return -1;

@@ -1,10 +1,10 @@
-#include <system.h>
-#include <printf.h>
-#include <module.h>
+#include <kernel/system.h>
+#include <kernel/printf.h>
+#include <kernel/module.h>
+#include <kernel/logging.h>
+#include <kernel/types.h>
 
-#include <logging.h>
-
-#include "../userspace/gui/terminal/lib/termemu.c"
+#include "../lib/termemu.c"
 
 static unsigned short * textmemptr = (unsigned short *)0xB8000;
 static void placech(unsigned char c, int x, int y, int attr) {
@@ -63,7 +63,7 @@ static void term_write(char c) {
 	write_string(foo);
 }
 
-static uint32_t vga_write(fs_node_t * node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+static uint32_t vga_write(fs_node_t * node, uint64_t offset, uint32_t size, uint8_t *buffer) {
 	/* XXX do some terminal processing like we did in the old days */
 	size_t i = 0;
 	while (*buffer && i < size) {
@@ -120,10 +120,6 @@ static void input_buffer_stuff(char * str) {
 	return;
 }
 
-static void set_term_font_size(float s) {
-	/* Do nothing */
-}
-
 static void set_title(char * c) {
 	/* Do nothing */
 }
@@ -146,12 +142,13 @@ term_callbacks_t term_callbacks = {
 	term_scroll,
 	term_redraw_cursor,
 	input_buffer_stuff,
-	set_term_font_size,
 	set_title,
 	unsupported,
 	unsupported_int,
 	unsupported_int,
 	term_set_csr_show,
+	NULL,
+	NULL,
 };
 
 

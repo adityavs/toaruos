@@ -1,53 +1,26 @@
 #!/bin/bash
 
-COOKIE=".2016-12-03-dynamic.cookie"
+# Give other users access to /root
+# (We probably should have just built the build tools somewhere else...)
+chmod o+x /root
 
-unset CC
+# Who owns this directory?
+NEWUID=`stat -c '%u' .`
 
-if [ ! -e "toolchain/local/$COOKIE" ]; then
-    echo "=== Cleaning any preexisting stuff... ==="
-    rm -fr toolchain/build
-    rm -fr toolchain/local
-    rm -fr toolchain/tarballs/*
-    echo "=== Starting watchdog ==="
-    (
-        while [ 1 == 1 ]; do
-            echo "..."
-            sleep 1m
-        done
-    ) &
-    watchdog_pid=$!
-    echo "=== Begin Toolchain Build ==="
-    pushd toolchain
-        unset PKG_CONFIG_LIBDIR
-        ./prepare.sh
-        ./install.sh
-        date > ./local/$COOKIE
-    popd
-    echo "=== End Toolchain Build ==="
-    echo "=== Stopping watchdog ==="
-    kill $watchdog_pid
-else
-    echo "=== Toolchain was cached. ==="
+if [[ "$NEWUID" == "0" ]]; then
+    echo "Are you running this on Docker for Mac? Owner UID is 0, going to use 501 instead."
+    NEWUID=501
 fi
 
-. toolchain/activate.sh
+# Create a fake user with this name
+useradd -u $NEWUID local
 
-make || exit 1
+# Map the build tools
+ln -s /root/gcc_local util/local
 
-echo "=== Running test suite. ==="
+# Run make as local
+runuser -u local -- make -j4
 
-expect util/test-travis.exp || exit 1
-
-echo "=== Building live CD ==="
-
-git fetch --unshallow
-
-git clone . _cdsource || exit 1
-
-cd _cdsource
-
-make cdrom || exit 1
-
-echo "=== Done. ==="
+# Remove the build tools
+rm util/local
 

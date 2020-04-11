@@ -1,14 +1,15 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2014 Kevin Lange
+ * Copyright (C) 2014-2018 K. Lange
  */
-#include <system.h>
-#include <logging.h>
-#include <fs.h>
-#include <hashmap.h>
-#include <elf.h>
-#include <module.h>
+#include <kernel/system.h>
+#include <kernel/logging.h>
+#include <kernel/fs.h>
+#include <kernel/elf.h>
+#include <kernel/module.h>
+
+#include <toaru/hashmap.h>
 
 #define SYMBOLTABLE_HASHMAP_SIZE 10
 #define MODULE_HASHMAP_SIZE 10
@@ -44,21 +45,28 @@ void (* symbol_find(const char * name))(void) {
 int module_quickcheck(void * blob) {
 
 	Elf32_Header * target = (Elf32_Header *)blob;
+	char * head = (char *)blob;
 
 	if (target->e_ident[0] != ELFMAG0 ||
 		target->e_ident[1] != ELFMAG1 ||
 		target->e_ident[2] != ELFMAG2 ||
 		target->e_ident[3] != ELFMAG3) {
 
-		char * head = (char *)blob;
-		if (head[0] == 'P' && head[1] == 'A' && head[2] == 'C' && head[3] == 'K') {
-			return 2;
-		}
+		goto _maybe_pack;
+	}
 
-		return 0;
+	if (target->e_type != ET_REL) {
+		goto _maybe_pack;
 	}
 
 	return 1;
+
+_maybe_pack:
+	if (head[0] == 'P' && head[1] == 'A' && head[2] == 'C' && head[3] == 'K') {
+		return 2;
+	}
+
+	return 0;
 }
 
 void * module_load_direct(void * blob, size_t length) {
@@ -145,8 +153,11 @@ void * module_load_direct(void * blob, size_t length) {
 		goto mod_load_error_unload;
 	}
 
+	uintptr_t text_addr = 0;
+
 	{
 		debug_print(INFO, "Loading sections.");
+		int index = 0;
 		for (unsigned int x = 0; x < (unsigned int)target->e_shentsize * target->e_shnum; x += target->e_shentsize) {
 			Elf32_Shdr * shdr = (Elf32_Shdr *)((uintptr_t)target + (target->e_shoff + x));
 			if (shdr->sh_type == SHT_NOBITS) {
@@ -154,7 +165,11 @@ void * module_load_direct(void * blob, size_t length) {
 				memset((void *)shdr->sh_addr, 0x00, shdr->sh_size);
 			} else {
 				shdr->sh_addr = (Elf32_Addr)target + shdr->sh_offset;
+				if (index == 1) {
+					text_addr = shdr->sh_addr;
+				}
 			}
+			index++;
 		}
 	}
 
@@ -196,7 +211,8 @@ void * module_load_direct(void * blob, size_t length) {
 							 */
 							if (!set && table->st_shndx == 65522) {
 								if (!hashmap_get(symboltable, name)) {
-									void * final = calloc(1, table->st_value);
+									void * final = malloc(table->st_value);
+									memset(final, 0, table->st_value);
 									debug_print(NOTICE, "point %s to 0x%x", name, (uintptr_t)final);
 									hashmap_set(symboltable, name, (void *)final);
 									hashmap_set(local_symbols, name, (void *)final);
@@ -207,7 +223,36 @@ void * module_load_direct(void * blob, size_t length) {
 							uintptr_t final = s->sh_addr + table->st_value;
 							hashmap_set(symboltable, name, (void *)final);
 							hashmap_set(local_symbols, name, (void *)final);
+						} else {
+							debug_print(ERROR, "Not resolving %s", name);
 						}
+					}
+				} else if (ELF32_ST_BIND(table->st_info) == STB_LOCAL) {
+					char * name = (char *)((uintptr_t)symstrtab + table->st_name);
+					Elf32_Shdr * s = NULL;
+					{
+						int i = 0;
+						int set = 0;
+						for (unsigned int x = 0; x < (unsigned int)target->e_shentsize * target->e_shnum; x += target->e_shentsize) {
+							Elf32_Shdr * shdr = (Elf32_Shdr *)((uintptr_t)target + (target->e_shoff + x));
+							if (i == table->st_shndx) {
+								set = 1;
+								s = shdr;
+								break;
+							}
+							i++;
+						}
+						if (!set && table->st_shndx == 65522) {
+							if (!hashmap_get(symboltable, name)) {
+								void * final = calloc(1, table->st_value);
+								debug_print(NOTICE, "point %s to 0x%x", name, (uintptr_t)final);
+								hashmap_set(local_symbols, name, (void *)final);
+							}
+						}
+					}
+					if (s) {
+						uintptr_t final = s->sh_addr + table->st_value;
+						hashmap_set(local_symbols, name, (void *)final);
 					}
 				}
 			}
@@ -248,9 +293,15 @@ void * module_load_direct(void * blob, size_t length) {
 						addend = *ptr;
 						place  = (uintptr_t)ptr;
 						if (!hashmap_get(symboltable, name)) {
-							debug_print(ERROR, "Wat? Missing symbol %s", name);
+							if (!hashmap_get(local_symbols, name)) {
+								debug_print(ERROR, "Wat? Missing symbol %s", name);
+								debug_print(ERROR, "Here's all the symbols:");
+							} else {
+								symbol = (uintptr_t)hashmap_get(local_symbols, name);
+							}
+						} else {
+							symbol = (uintptr_t)hashmap_get(symboltable, name);
 						}
-						symbol = (uintptr_t)hashmap_get(symboltable, name);
 					}
 					switch (ELF32_R_TYPE(table->r_info)) {
 						case 1:
@@ -303,6 +354,7 @@ void * module_load_direct(void * blob, size_t length) {
 	mod_data->end      = (uintptr_t)target + length;
 	mod_data->deps     = deps;
 	mod_data->deps_length = deps_length;
+	mod_data->text_addr = text_addr;
 
 	hashmap_set(modules, mod_info->name, (void *)mod_data);
 
@@ -313,6 +365,12 @@ mod_load_error_unload:
 
 mod_load_error:
 	return NULL;
+}
+
+uintptr_t module_get_text_addr(char * name) {
+	module_data_t * mod_data = hashmap_get(modules, name);
+	if (!mod_data) return -1;
+	return mod_data->text_addr;
 }
 
 /**
