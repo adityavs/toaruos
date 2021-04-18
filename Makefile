@@ -26,7 +26,7 @@ TARGET_TRIPLET=i686-pc-toaru
 CC=$(TARGET_TRIPLET)-gcc
 AR=$(TARGET_TRIPLET)-ar
 AS=$(TARGET_TRIPLET)-as
-CFLAGS= -O3 -g -std=gnu99 -I. -Iapps -pipe -mmmx -msse -msse2 -fplan9-extensions -Wall -Wextra -Wno-unused-parameter
+CFLAGS= -O3 -s -std=gnu99 -I. -Iapps -pipe -mmmx -msse -msse2 -fplan9-extensions -Wall -Wextra -Wno-unused-parameter
 
 ##
 # C library objects from libc/ C sources (and setjmp, which is assembly)
@@ -38,7 +38,7 @@ LC=base/lib/libc.so
 ##
 #  APPS      = C sources from apps/
 #  APPS_X    = binaries
-#  APPS_Y    = generated makefiles for binaries (except init)
+#  APPS_Y    = generated makefiles for binaries
 #  APPS_SH   = shell scripts to copy to base/bin/ and mark executable
 #  APPS_SH_X = destinations for shell scripts
 APPS=$(patsubst apps/%.c,%,$(wildcard apps/*.c))
@@ -46,6 +46,8 @@ APPS_X=$(foreach app,$(APPS),base/bin/$(app))
 APPS_Y=$(foreach app,$(APPS),.make/$(app).mak)
 APPS_SH=$(patsubst apps/%.sh,%.sh,$(wildcard apps/*.sh))
 APPS_SH_X=$(foreach app,$(APPS_SH),base/bin/$(app))
+APPS_KRK=$(patsubst apps/%.krk,%.krk,$(wildcard apps/*.krk))
+APPS_KRK_X=$(foreach app,$(APPS_KRK),base/bin/$(app))
 
 ##
 # LIBS   = C sources from lib/
@@ -58,12 +60,12 @@ LIBS_Y=$(foreach lib,$(LIBS),.make/$(lib).lmak)
 SOURCE_FILES  = $(wildcard kernel/*.c kernel/*/*.c kernel/*/*/*.c modules/*.c)
 SOURCE_FILES += $(wildcard apps/*.c linker/*.c libc/*.c libc/*/*.c lib/*.c)
 
-tags: $(SOURCE_FILES)
-	ctags -f tags $(SOURCE_FILES)
+tags: $(SOURCE_FILES) $(wildcard kuroko/src/*.c kuroko/src/*.h)
+	ctags -f tags $(SOURCE_FILES) $(wildcard kuroko/src/*.c kuroko/src/*.h)
 
 ##
 # Files that must be present in the ramdisk (apps, libraries)
-RAMDISK_FILES= ${APPS_X} ${APPS_SH_X} ${LIBS_X} base/lib/ld.so base/lib/libm.so
+RAMDISK_FILES= ${APPS_X} ${APPS_SH_X} ${APPS_KRK_X} ${LIBS_X} base/lib/ld.so base/lib/libm.so ${KUROKO_FILES}
 
 # Kernel / module flags
 
@@ -99,6 +101,7 @@ KERNEL_OBJS += $(patsubst %.c,%.o,$(wildcard kernel/*/*/*.c))
 ##
 # Kernel objects from kernel/ assembly sources
 KERNEL_ASMOBJS = $(filter-out kernel/symbols.o,$(patsubst %.S,%.o,$(wildcard kernel/*.S)))
+HEADERS = $(wildcard base/usr/include/kernel/*.h base/usr/include/kernel/*/*.h)
 
 # Kernel
 
@@ -139,7 +142,6 @@ fatbase/mod:
 ##
 # Modules need to be installed on the boot image
 MODULES = $(patsubst modules/%.c,fatbase/mod/%.ko,$(wildcard modules/*.c))
-HEADERS = $(wildcard base/usr/include/kernel/*.h base/usr/include/kernel/*/*.h)
 
 fatbase/mod/%.ko: modules/%.c ${HEADERS} | fatbase/mod
 	${KCC} -nostdlib ${KCFLAGS} -c -o $@ $<
@@ -162,13 +164,15 @@ base/cdrom:
 	mkdir -p $@
 base/var:
 	mkdir -p $@
+base/lib/kuroko:
+	mkdir -p $@
 fatbase/efi/boot:
 	mkdir -p $@
 cdrom:
 	mkdir -p $@
 .make:
 	mkdir -p .make
-dirs: base/dev base/tmp base/proc base/bin base/lib base/cdrom cdrom base/var fatbase/efi/boot .make
+dirs: base/dev base/tmp base/proc base/bin base/lib base/cdrom base/lib/kuroko cdrom base/var fatbase/efi/boot .make
 
 # C Library
 
@@ -191,6 +195,34 @@ base/lib/libc.so: ${LIBC_OBJS} | dirs crts
 
 base/lib/libm.so: util/lm.c | dirs crts
 	$(CC) -nodefaultlibs -o $@ $(CFLAGS) -shared -fPIC $^ -lgcc
+
+KUROKO_OBJS=$(patsubst %.c, %.o, $(filter-out kuroko/src/module_% kuroko/src/rline.c kuroko/src/kuroko.c, $(sort $(wildcard kuroko/src/*.c))))
+kuroko/%.o: kuroko/%.c
+	$(CC) $(CFLAGS) -fPIC -c -o $@ $^
+
+KUROKO_CMODS=$(patsubst kuroko/src/module_%.c,%,$(wildcard kuroko/src/module_*.c)) $(patsubst lib/kuroko/%.c,%,$(wildcard lib/kuroko/*.c))
+KUROKO_CMODS_X=$(foreach lib,$(KUROKO_CMODS),base/lib/kuroko/$(lib).so)
+KUROKO_CMODS_Y=$(foreach lib,$(KUROKO_CMODS),.make/$(lib).kmak)
+KUROKO_KRK_MODS=$(patsubst kuroko/modules/%.krk,base/lib/kuroko/%.krk,$(wildcard kuroko/modules/*.krk kuroko/modules/*/*.krk))
+
+KUROKO_FILES=$(KUROKO_CMODS_X) $(KUROKO_KRK_MODS) base/lib/libkuroko.so
+
+base/lib/kuroko/%.krk: kuroko/modules/%.krk
+	@mkdir -p `dirname $@`
+	cp $< $@
+
+.make/%.kmak: kuroko/src/module_%.c util/auto-dep.py | dirs
+	util/auto-dep.py --makekurokomod $< > $@
+
+.make/%.kmak: lib/kuroko/%.c util/auto-dep.py | dirs
+	util/auto-dep.py --makekurokomod $< > $@
+
+ifeq (,$(findstring clean,$(MAKECMDGOALS)))
+-include ${KUROKO_CMODS_Y}
+endif
+
+base/lib/libkuroko.so: $(KUROKO_OBJS)  | dirs crts ${LC}
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $^ -lgcc
 
 # Userspace Linker/Loader
 
@@ -222,9 +254,15 @@ base/bin/%.sh: apps/%.sh
 	cp $< $@
 	chmod +x $@
 
+base/bin/%.krk: apps/%.krk
+	cp $< $@
+	chmod +x $@
+
 # Ramdisk
-fatbase/ramdisk.img: ${RAMDISK_FILES} $(shell find base) Makefile util/createramdisk.py | dirs
+fatbase/ramdisk.igz: ${RAMDISK_FILES} $(shell find base) Makefile util/createramdisk.py | dirs
 	python3 util/createramdisk.py
+	gzip -c fatbase/ramdisk.img > fatbase/ramdisk.igz
+	rm fatbase/ramdisk.img
 
 # CD image
 
@@ -238,7 +276,7 @@ EFI_UPDATE=util/update-extents.py
 
 image.iso: ${EFI_BOOT} cdrom/boot.sys fatbase/netinit ${MODULES} util/update-extents.py
 	xorriso -as mkisofs -R -J -c bootcat \
-	  -b boot.sys -no-emul-boot -boot-load-size 24 \
+	  -b boot.sys -no-emul-boot -boot-load-size full \
 	  ${EFI_XORRISO} \
 	  -o image.iso cdrom
 	${EFI_UPDATE}
@@ -250,7 +288,7 @@ image.iso: ${EFI_BOOT} cdrom/boot.sys fatbase/netinit ${MODULES} util/update-ext
 # This is the filesystem the EFI loaders see, so it must contain
 # the kernel, modules, and ramdisk, plus anything else we want
 # available to the bootloader (eg., netinit).
-cdrom/fat.img: fatbase/ramdisk.img ${MODULES} fatbase/kernel fatbase/netinit fatbase/efi/boot/bootia32.efi fatbase/efi/boot/bootx64.efi util/mkdisk.sh | dirs
+cdrom/fat.img: fatbase/ramdisk.igz ${MODULES} fatbase/kernel fatbase/netinit fatbase/efi/boot/bootia32.efi fatbase/efi/boot/bootx64.efi util/mkdisk.sh | dirs
 	util/mkdisk.sh $@ fatbase
 
 ##
@@ -281,7 +319,7 @@ cdrom/boot.sys: boot/boot.o boot/cstuff.o boot/link.ld | dirs
 	${KLD} -T boot/link.ld -o $@ boot/boot.o boot/cstuff.o
 
 boot/cstuff.o: boot/cstuff.c boot/*.h
-	${CC} -c -Os -o $@ $<
+	${CC} -c -Os -s -o $@ $<
 
 boot/boot.o: boot/boot.S
 	${AS} -o $@ $<
@@ -293,7 +331,7 @@ clean:
 	rm -f ${APPS_X} ${APPS_SH_X}
 	rm -f libc/*.o libc/*/*.o
 	rm -f image.iso
-	rm -f fatbase/ramdisk.img
+	rm -f fatbase/ramdisk.img fatbase/ramdisk.igz
 	rm -f cdrom/boot.sys
 	rm -f boot/*.o
 	rm -f boot/*.efi
@@ -305,6 +343,8 @@ clean:
 	rm -f base/lib/crt*.o
 	rm -f ${MODULES}
 	rm -f ${APPS_Y} ${LIBS_Y} ${EXT_LIBS_Y}
+	rm -f ${KUROKO_FILES}
+	rm -f kuroko/src/*.o
 
 ifneq (,$(findstring Microsoft,$(shell uname -r)))
   QEMU_ARGS=-serial mon:stdio -m 1G -rtc base=localtime -vnc :0
@@ -329,9 +369,11 @@ fast: image.iso
 
 .PHONY: headless
 headless: image.iso
-	@qemu-system-i386 -cdrom $< ${QEMU_ARGS} \
-	  -nographic -no-reboot \
-	  -fw_cfg name=opt/org.toaruos.bootmode,string=headless
+	@qemu-system-i386 -cdrom $< -m 1G ${KVM} -rtc base=localtime ${QEMU_EXTRA} \
+	  -serial null -serial mon:stdio \
+	  -nographic -no-reboot -audiodev none,id=id \
+	  -fw_cfg name=opt/org.toaruos.bootmode,string=headless \
+	  -fw_cfg name=opt/org.toaruos.gettyargs,string="-a local /dev/ttyS1"
 
 .PHONY: shell
 shell: image.iso

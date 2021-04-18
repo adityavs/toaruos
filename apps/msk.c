@@ -361,10 +361,9 @@ static int install_package(char * pkg) {
 		}
 
 		char cmd[1024];
-		sprintf(cmd, "cd %s; ungz %s /tmp/%s.tar; tar -xf /tmp/%s.tar; rm /tmp/%s.tar",
+		sprintf(cmd, "cd %s; tar -xzf %s",
 				confreader_get(msk_manifest, pkg, "destination"),
-				confreader_get(msk_manifest, pkg, "source"),
-				pkg, pkg, pkg);
+				confreader_get(msk_manifest, pkg, "source"));
 
 		int status;
 		if ((status = system(cmd))) {
@@ -423,7 +422,7 @@ static int install_packages(int argc, char * argv[]) {
 			notfirst = 1;
 		}
 		fprintf(stderr, "\nContinue? [Y/n] ");
-		fflush(stdout);
+		fflush(stderr);
 		char resp[4];
 		fgets(resp, 4, stdin);
 		if (!(!strcmp(resp,"\n") || !strcmp(resp,"y\n") || !strcmp(resp,"Y\n") || !strcmp(resp,"yes\n"))) {

@@ -20,6 +20,13 @@ struct _FILE {
 	int bufsiz;
 	long last_read_start;
 	char * _name;
+
+	char * write_buf;
+	size_t written;
+	size_t wbufsiz;
+
+	struct _FILE * prev;
+	struct _FILE * next;
 };
 
 FILE _stdin = {
@@ -32,6 +39,10 @@ FILE _stdin = {
 	.eof = 0,
 	.last_read_start = 0,
 	.bufsiz = BUFSIZ,
+
+	.wbufsiz = BUFSIZ,
+	.write_buf = NULL,
+	.written = 0,
 };
 
 FILE _stdout = {
@@ -44,6 +55,10 @@ FILE _stdout = {
 	.eof = 0,
 	.last_read_start = 0,
 	.bufsiz = BUFSIZ,
+
+	.wbufsiz = BUFSIZ,
+	.write_buf = NULL,
+	.written = 0,
 };
 
 FILE _stderr = {
@@ -56,19 +71,33 @@ FILE _stderr = {
 	.eof = 0,
 	.last_read_start = 0,
 	.bufsiz = BUFSIZ,
+
+	.wbufsiz = BUFSIZ,
+	.write_buf = NULL,
+	.written = 0,
 };
 
 FILE * stdin = &_stdin;
 FILE * stdout = &_stdout;
 FILE * stderr = &_stderr;
 
+static FILE * _head = NULL;
+
 void __stdio_init_buffers(void) {
 	_stdin.read_buf = malloc(BUFSIZ);
-	//_stdout.read_buf = malloc(BUFSIZ);
-	//_stderr.read_buf = malloc(BUFSIZ);
+	_stdout.write_buf = malloc(BUFSIZ);
+	_stderr.write_buf = malloc(BUFSIZ);
 	_stdin._name = strdup("stdin");
 	_stdout._name = strdup("stdout");
 	_stderr._name = strdup("stderr");
+}
+
+void __stdio_cleanup(void) {
+	if (stdout) fflush(stdout);
+	if (stderr) fflush(stderr);
+	while (_head) {
+		fclose(_head);
+	}
 }
 
 #if 0
@@ -97,6 +126,32 @@ int setvbuf(FILE * stream, char * buf, int mode, size_t size) {
 		stream->bufsiz = size;
 	}
 	return 0;
+}
+
+int fflush(FILE * stream) {
+	if (!stream->write_buf) return EOF;
+	if (stream->written) {
+		syscall_write(stream->fd, stream->write_buf, stream->written);
+		stream->written = 0;
+	}
+	return 0;
+}
+
+static size_t write_bytes(FILE * f, char * buf, size_t len) {
+	if (!f->write_buf) return 0;
+
+	size_t newBytes = 0;
+	while (len > 0) {
+		f->write_buf[f->written++] = *buf;
+		if (f->written == (size_t)f->bufsiz || *buf == '\n') {
+			fflush(f);
+		}
+		newBytes++;
+		buf++;
+		len--;
+	}
+
+	return newBytes;
 }
 
 static size_t read_bytes(FILE * f, char * out, size_t len) {
@@ -206,6 +261,14 @@ FILE * fopen(const char *path, const char *mode) {
 	out->eof = 0;
 	out->_name = strdup(path);
 
+	out->write_buf = malloc(BUFSIZ);
+	out->written = 0;
+	out->wbufsiz = BUFSIZ;
+
+	out->next = _head;
+	if (_head) _head->prev = out;
+	_head = out;
+
 	return out;
 }
 
@@ -213,9 +276,8 @@ FILE * fopen(const char *path, const char *mode) {
 FILE * freopen(const char *path, const char *mode, FILE * stream) {
 
 	if (path) {
-		if (stream) {
-			fclose(stream);
-		}
+		fflush(stream);
+		syscall_close(stream->fd);
 		int flags, mask;
 		parse_mode(mode, &flags, &mask);
 		int fd = syscall_open(path, flags, mask);
@@ -226,6 +288,12 @@ FILE * freopen(const char *path, const char *mode, FILE * stream) {
 		stream->ungetc = -1;
 		stream->eof = 0;
 		stream->_name = strdup(path);
+		stream->written = 0;
+		if (stream != &_stdin && stream != &_stdout && stream != &_stderr) {
+			stream->next = _head;
+			if (_head) _head->prev = stream;
+			_head = stream;
+		}
 		if (fd < 0) {
 			errno = -fd;
 			return NULL;
@@ -253,9 +321,18 @@ FILE * fdopen(int fd, const char *mode){
 	out->offset = 0;
 	out->ungetc = -1;
 	out->eof = 0;
+
 	char tmp[30];
 	sprintf(tmp, "fd[%d]", fd);
 	out->_name = strdup(tmp);
+
+	out->write_buf = malloc(BUFSIZ);
+	out->written = 0;
+	out->wbufsiz = BUFSIZ;
+
+	out->next = _head;
+	if (_head) _head->prev = out;
+	_head = out;
 
 	return out;
 }
@@ -265,12 +342,20 @@ int _fwouldblock(FILE * stream) {
 }
 
 int fclose(FILE * stream) {
+	fflush(stream);
 	int out = syscall_close(stream->fd);
 	free(stream->_name);
 	free(stream->read_buf);
+	if (stream->write_buf) free(stream->write_buf);
+	stream->write_buf = NULL;
 	if (stream == &_stdin || stream == &_stdout || stream == &_stderr) {
 		return out;
 	} else {
+
+		if (stream->prev) stream->prev->next = stream->next;
+		if (stream->next) stream->next->prev = stream->prev;
+		if (stream == _head) _head = stream->next;
+
 		free(stream);
 		return out;
 	}
@@ -295,6 +380,9 @@ int fseek(FILE * stream, long offset, int whence) {
 			whence = SEEK_SET;
 		}
 	}
+	if (stream->written) {
+		fflush(stream);
+	}
 	stream->offset = 0;
 	stream->read_from = 0;
 	stream->available = 0;
@@ -312,6 +400,9 @@ int fseek(FILE * stream, long offset, int whence) {
 long ftell(FILE * stream) {
 	if (_argv_0 && strcmp(_argv_0, "ld.so") && __libc_debug) {
 		fprintf(stderr, "%s: ftell(%s)\n", _argv_0, stream->_name);
+	}
+	if (stream->written) {
+		fflush(stream);
 	}
 	if (stream->read_from || stream->last_read_start) {
 		return stream->last_read_start + stream->read_from;
@@ -357,36 +448,34 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE * stream) {
 }
 
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE * stream) {
-	size_t out_size = size * nmemb;
-
-	if (!out_size) return 0;
-
-	int r = syscall_write(stream->fd, (void*)ptr, out_size);
-	if (r < 0) {
-		errno = -r;
-		return -1;
+	char * tracking = (char*)ptr;
+	for (size_t i = 0; i < nmemb; ++i) {
+		int r = write_bytes(stream, tracking, size);
+		if (r < 0) {
+			return -1;
+		}
+		tracking += r;
+		if (r < (int)size) {
+			return i;
+		}
 	}
-
-	return r / size;
+	return nmemb;
 }
 
 int fileno(FILE * stream) {
 	return stream->fd;
 }
 
-int fflush(FILE * stream) {
-	return 0;
-}
-
 int fputs(const char *s, FILE *stream) {
-	fwrite(s, strlen(s), 1, stream);
-	/* eof? */
+	while (*s) {
+		fputc(*s++, stream);
+	}
 	return 0;
 }
 
 int fputc(int c, FILE *stream) {
 	char data[] = {c};
-	fwrite(data, 1, 1, stream);
+	write_bytes(stream, data, 1);
 	return c;
 }
 

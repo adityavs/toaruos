@@ -327,20 +327,11 @@ int main(int argc, char * argv[]) {
 	window = yutani_window_create(yctx, width + bounds.width, height + bounds.height);
 
 	/* Load icons */
-	load_sprite(&logo, "/usr/share/logo_login.bmp");
-	logo.alpha = ALPHA_EMBEDDED;
-
-	load_sprite(&terminal, "/usr/share/icons/48/utilities-terminal.bmp");
-	terminal.alpha = ALPHA_EMBEDDED;
-
-	load_sprite(&folder, "/usr/share/icons/48/folder.bmp");
-	folder.alpha = ALPHA_EMBEDDED;
-
-	load_sprite(&package, "/usr/share/icons/48/package.bmp");
-	package.alpha = ALPHA_EMBEDDED;
-
-	load_sprite(&mouse_drag, "/usr/share/cursor/drag.bmp");
-	mouse_drag.alpha = ALPHA_EMBEDDED;
+	load_sprite(&logo, "/usr/share/logo_login.png");
+	load_sprite(&terminal, "/usr/share/icons/48/utilities-terminal.png");
+	load_sprite(&folder, "/usr/share/icons/48/folder.png");
+	load_sprite(&package, "/usr/share/icons/48/package.png");
+	load_sprite(&mouse_drag, "/usr/share/cursor/drag.png");
 
 	load_page(0);
 
